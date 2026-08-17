@@ -4,6 +4,28 @@ This document records the chronological engineering diary and technical decision
 
 ---
 
+## 2026-08-18 — Phase 1: Evidence Ingestion
+
+### Objectives
+- Implement deterministic ingestion pipelines for multiple evidence formats (PDF, DOCX, TXT, CSV, JSON, LOG).
+- Establish the `Source` and `SourceChunk` models and ensure robust file persistence.
+- Develop the Ingestion Orchestrator to route files through validators, storage, and parsers.
+- Build the React Evidence Management UI to support uploads and chunk inspection.
+- Strictly adhere to the invariant: "EVIDENCE ≠ INFERENCE".
+
+### Key Decisions Made
+1. **Parser Registry**: Implemented a dynamic `ParserRegistry` allowing modular parser extension for various file types.
+2. **Deterministic Chunking**: Replaced complex chunking with strict, rule-based extraction tailored to each format (e.g. paragraph-level for TXT/DOCX, row-level for CSV/JSON).
+3. **Reconciliation vs Recreation**: Handled a database mismatch securely by explicitly stamping Alembic state rather than destroying previous DB contents, ensuring persistence of Phase 0 state.
+4. **React Component State**: Chose to keep `EvidenceManager` within the core `App.tsx` shell using conditional rendering, prioritizing velocity and layout consistency for Phase 1.
+
+### Outcomes
+- Evidence Ingestion APIs (`POST /cases/{id}/sources`) and DB migrations correctly built and tested.
+- Frontend successfully integrated with Source list rendering, Upload modals, and an evidence chunk inspector.
+- All integration tests passing.
+
+---
+
 ## 2026-08-17 — Phase 0: Project Foundation Initialization
 
 ### Objectives

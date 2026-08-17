@@ -10,6 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased] - 2026-08-17
 
 ### Added
+- **Evidence Ingestion (Phase 1)**:
+  - Evidence File Upload REST API (`POST /api/v1/cases/{case_id}/sources/upload`).
+  - Modular `ParserRegistry` with deterministic extractors for PDF, DOCX, TXT, CSV, JSON, and LOG formats.
+  - Safe, deterministic chunking strategy tailored to each supported format (page/paragraph/row extraction).
+  - Secure file storage service with path traversal protection and SHA-256 deduplication.
+  - `Source` and `SourceChunk` SQLite database models with Alembic migrations.
+  - Evidence Manager React component integrated into the frontend application shell.
+  - Evidence Upload Modal and Chunk Inspector Modal.
+  - Source fetching and chunk-listing backend endpoints with robust pagination.
 - **Project Foundation (Phase 0)**:
   - Initialized Git repository and root `.gitignore`, `.env.example`.
   - Established Master Specification (`docs/MASTER_SPECIFICATION.md`) with 47 architectural and domain sections.

@@ -20,19 +20,19 @@
 ---
 
 ## Phase 1: Evidence Ingestion
-- [ ] **1.1** Implement file upload API endpoint (`POST /api/v1/cases/{case_id}/sources/upload`)
-- [ ] **1.2** Implement file deduplication using SHA-256 content hashes
-- [ ] **1.3** Implement `BaseParser` interface and `ParserRegistry`
-- [ ] **1.4** Implement PDF parser (PyMuPDF / `fitz`)
-- [ ] **1.5** Implement DOCX parser (`python-docx`)
-- [ ] **1.6** Implement TXT parser
-- [ ] **1.7** Implement CSV parser (`pandas`)
-- [ ] **1.8** Implement JSON parser
-- [ ] **1.9** Implement LOG file parser
-- [ ] **1.10** Implement Source Chunk persistence in SQLite
-- [ ] **1.11** Build Source upload & file management UI in frontend
-- [ ] **1.12** Build Source preview & Chunk inspector UI
-- [ ] **1.13** Write parser unit tests and ingestion integration tests
+- [x] **1.1** Implement file upload API endpoint (`POST /api/v1/cases/{case_id}/sources/upload`)
+- [x] **1.2** Implement file deduplication using SHA-256 content hashes
+- [x] **1.3** Implement `BaseParser` interface and `ParserRegistry`
+- [x] **1.4** Implement PDF parser (PyMuPDF / `fitz`)
+- [x] **1.5** Implement DOCX parser (`python-docx`)
+- [x] **1.6** Implement TXT parser
+- [x] **1.7** Implement CSV parser (`pandas`)
+- [x] **1.8** Implement JSON parser
+- [x] **1.9** Implement LOG file parser
+- [x] **1.10** Implement Source Chunk persistence in SQLite
+- [x] **1.11** Build Source upload & file management UI in frontend
+- [x] **1.12** Build Source preview & Chunk inspector UI
+- [x] **1.13** Write parser unit tests and ingestion integration tests
 
 ---
 

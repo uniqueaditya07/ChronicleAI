@@ -1,4 +1,4 @@
-import type { HealthResponse, Case, CaseListResponse, CaseCreatePayload, ApiError } from '@/types/api'
+import type { HealthResponse, Case, CaseListResponse, CaseCreatePayload, ApiError, Source, SourceListResponse, SourceChunkListResponse } from '@/types/api'
 
 const API_BASE = '/api/v1'
 
@@ -57,6 +57,46 @@ class ApiClient {
     return this.request<void>(`/cases/${caseId}`, {
       method: 'DELETE',
     })
+  }
+
+  // --- Sources ---
+  
+  async listSources(caseId: string, skip: number = 0, limit: number = 100): Promise<SourceListResponse> {
+    return this.request<SourceListResponse>(`/cases/${caseId}/sources?skip=${skip}&limit=${limit}`)
+  }
+
+  async getSource(caseId: string, sourceId: string): Promise<Source> {
+    return this.request<Source>(`/cases/${caseId}/sources/${sourceId}`)
+  }
+
+  async listSourceChunks(caseId: string, sourceId: string, skip: number = 0, limit: number = 100): Promise<SourceChunkListResponse> {
+    return this.request<SourceChunkListResponse>(`/cases/${caseId}/sources/${sourceId}/chunks?skip=${skip}&limit=${limit}`)
+  }
+
+  async uploadSource(caseId: string, file: File): Promise<Source> {
+    const url = `${API_BASE}/cases/${caseId}/sources/`
+    const formData = new FormData()
+    formData.append('file', file)
+
+    // Using native fetch because we don't want 'Content-Type': 'application/json' for FormData
+    const response = await fetch(url, {
+      method: 'POST',
+      body: formData,
+    })
+
+    if (!response.ok) {
+      let errorData: { error?: ApiError } = {}
+      try {
+        errorData = await response.json()
+      } catch {
+        // Response was not JSON
+      }
+      
+      const message = errorData.error?.message || `HTTP ${response.status}: ${response.statusText}`
+      throw new Error(message)
+    }
+
+    return await response.json()
   }
 }
 

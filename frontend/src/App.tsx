@@ -11,6 +11,7 @@ import {
   FileCode2,
 } from 'lucide-react'
 import { AppLayout } from '@/components/layout/AppLayout'
+import { EvidenceManager } from '@/components/EvidenceManager'
 import { api } from '@/api/client'
 import type { HealthResponse, Case } from '@/types/api'
 
@@ -20,6 +21,8 @@ export function App() {
   const [cases, setCases] = useState<Case[]>([])
   const [casesLoading, setCasesLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  
+  const [selectedCase, setSelectedCase] = useState<Case | null>(null)
 
   // New Case Form State
   const [newCaseName, setNewCaseName] = useState('')
@@ -88,6 +91,9 @@ export function App() {
 
   return (
     <AppLayout health={health} healthLoading={healthLoading} error={error}>
+      {selectedCase ? (
+        <EvidenceManager caseRecord={selectedCase} onBack={() => setSelectedCase(null)} />
+      ) : (
       <div className="space-y-6">
         {/* Foundation Banner */}
         <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-xs">
@@ -255,13 +261,21 @@ export function App() {
                         {new Date(c.created_at).toLocaleTimeString()}
                       </div>
                     </div>
-                    <button
-                      onClick={() => handleDeleteCase(c.id)}
-                      className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-md transition-colors"
-                      title="Delete Case"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => setSelectedCase(c)}
+                        className="px-3 py-1 text-xs font-medium bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-md transition-colors"
+                      >
+                        Manage Evidence
+                      </button>
+                      <button
+                        onClick={() => handleDeleteCase(c.id)}
+                        className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-md transition-colors"
+                        title="Delete Case"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
                   </div>
                 ))
               )}
@@ -297,6 +311,7 @@ export function App() {
           </div>
         </div>
       </div>
+      )}
     </AppLayout>
   )
 }

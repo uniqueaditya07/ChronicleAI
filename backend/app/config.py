@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     DATA_DIR: Path = Path("./data")
     UPLOAD_DIR: Path = Path("./data/files")
     DATABASE_URL: str = "sqlite:///./data/chronicle.db"
+    MAX_UPLOAD_SIZE_BYTES: int = 50 * 1024 * 1024
+    ALLOWED_EXTENSIONS: List[str] = ["pdf", "docx", "txt", "csv", "json", "log"]
 
     # Logging
     LOG_LEVEL: str = "INFO"

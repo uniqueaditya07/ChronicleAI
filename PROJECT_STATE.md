@@ -6,10 +6,10 @@
 
 ## 1. Executive Summary
 
-- **Current Phase**: Phase 0 — Project Foundation
-- **Current Milestone**: Milestone 0.1 — Foundation Complete & Verified
-- **Overall Status**: Phase 0 objectives completed; ready for Phase 1 authorization.
-- **Last Updated**: 2026-08-17T23:45:00+05:30
+- **Current Phase**: Phase 1 — Evidence Ingestion
+- **Current Milestone**: Milestone 1.1 — Deterministic Extraction Engine Complete
+- **Overall Status**: Phase 1 objectives completed; ready for Phase 2 authorization.
+- **Last Updated**: 2026-08-18T01:05:00+05:30
 
 ---
 
@@ -27,23 +27,33 @@
 - [x] Implemented frontend application shell with live backend health telemetry and interactive Case creation widget.
 - [x] Documented Architecture Decision Records (`ADR-001`, `ADR-002`, `ADR-003`).
 
+### Phase 1 Evidence Ingestion
+- [x] Created `Source` and `SourceChunk` models with robust Alembic migrations safely stamping Phase 0.
+- [x] Built `StorageService` and `FileValidator` for secure, deterministic file persistence and hashing.
+- [x] Developed `BaseParser` interface and `ParserRegistry`.
+- [x] Implemented concrete parsers for PDF (PyMuPDF), DOCX (python-docx), CSV (pandas), JSON, TXT, and LOG.
+- [x] Integrated `IngestionService` coordinating upload validation, persistence, parsing, and DB chunk storage.
+- [x] Built FastAPI `POST /sources` and `GET /sources/{id}/chunks` endpoints and integration tests.
+- [x] Created React `EvidenceManager`, `SourceUploadModal`, `SourceList`, and `ChunkViewerModal` integrated into App shell.
+
 ---
 
 ## 3. Current Work
 
-- Verifying end-to-end integration and staging Phase 0 commit.
-- Awaiting review and instructions to begin Phase 1 (Evidence Ingestion).
+- Verifying Phase 1 complete functionality.
+- Staging and committing Phase 1 codebase.
+- Awaiting authorization to begin Phase 2 (Extraction Engine).
 
 ---
 
 ## 4. Next Task
 
-- **Phase 1: Evidence Ingestion**
-  - Implement file upload endpoint (`/api/v1/cases/{case_id}/sources/upload`).
-  - Implement parser framework (`BaseParser` interface and registry).
-  - Implement deterministic parsers: PyMuPDF (PDF), python-docx (DOCX), pandas (CSV), json (JSON), TXT, and LOG.
-  - Implement chunk storage and metadata extraction.
-  - Build Source upload and chunk viewer UI.
+- **Phase 2: Extraction Engine**
+  - Integrate Google GenAI SDK (Gemini).
+  - Implement Pydantic schema validation boundary for AI outputs.
+  - Construct prompt templates for Entities, Events, and Claims extraction.
+  - Implement chunk-by-chunk deduction orchestrator.
+  - Develop `ExtractionViewer` UI for reviewing pending deductions.
 
 ---
 
