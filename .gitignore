@@ -1,0 +1,78 @@
+# Credentials and environment; only the blank example is public.
+.env
+.env.*
+.envrc
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+credentials*.json
+service-account*.json
+secrets.*
+.secrets/
+
+# SQLite databases, WAL, shared memory, journals and local data.
+*.db
+*.sqlite
+*.sqlite3
+*.db-*
+*.sqlite-*
+*.sqlite3-*
+data/
+storage/
+evidence_storage/
+/evidence/
+
+# Python environments, bytecode, test storage and caches.
+.venv/
+.venv-*/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+test_storage*/
+test_*storage*/
+
+# JavaScript dependencies and builds.
+node_modules/
+dist/
+dist-ssr/
+.vite/
+coverage/
+*.local
+
+# Temporary files, logs, generated reports and exported evidence.
+tmp/
+temp/
+.tmp/
+.cache/
+*.tmp
+*.temp
+*.bak
+*.log
+reports/
+exports/
+ChronicleAI-case-*.html
+ChronicleAI-case-*.pdf
+
+# Historical internal reports are deliberately excluded.
+/CHRONICLEAI_COMPLETE_PROJECT_AUDIT.md
+/CHRONICLEAI_GEMINI_VERIFICATION_REPORT.md
+
+# OS and editor files.
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo

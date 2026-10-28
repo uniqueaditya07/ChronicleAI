@@ -1,0 +1,8 @@
+fastapi==0.115.0
+uvicorn==0.30.6
+pytest==8.3.3
+httpx==0.28.1
+sqlalchemy==2.0.35
+python-multipart==0.0.12
+spacy==3.8.16
+google-genai==2.32.0
