@@ -313,6 +313,11 @@ def validate_and_filter_citations(
                 continue
 
             snippet = cit.get("snippet")
+            if snippet:
+                cited_lines = [line_content_map[(fid, ln)] for ln in range(start_l, end_l + 1)]
+                # A provider paraphrase must never be presented as a source quote.
+                if snippet not in "\n".join(cited_lines) and snippet not in " ".join(cited_lines):
+                    snippet = None
             if not snippet:
                 # Fill snippet from indexed content
                 snippet_lines = [

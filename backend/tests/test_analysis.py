@@ -790,6 +790,12 @@ def test_malformed_unicode_is_sanitized_502(section, field, text):
 @pytest.mark.parametrize("escape_unicode", [True, False], ids=["json-escapes", "raw-unicode"])
 def test_valid_unicode_survives_http_serialization_unchanged(text, escape_unicode):
     case_id, evidence_id = seed_test_case_with_evidence()
+    # Valid quoted Unicode must also occur in the indexed source it cites.
+    with TestingSessionLocal() as db:
+        db.query(EvidenceLine).filter(
+            EvidenceLine.evidence_file_id == evidence_id, EvidenceLine.line_number == 2,
+        ).update({"content": text})
+        db.commit()
     payload = valid_provider_payload(evidence_id)
     for section in ANALYSIS_SECTIONS[:3]:
         claim = deepcopy(payload["summary"][0])

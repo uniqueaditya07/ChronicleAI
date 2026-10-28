@@ -342,3 +342,23 @@ def test_presentation_model_and_environment_override_are_shared_by_analysis_and_
     assert call["config"].response_mime_type == "application/json"
     assert call["config"].temperature == 0.2
     assert response.json()["summary"][0]["citations"][0]["evidence_file_id"] == file["id"]
+
+
+@pytest.mark.parametrize("endpoint", ["analysis", "chat"])
+@pytest.mark.parametrize("snippet,expected", [
+    ("12 October 2026", "12 October 2026"),
+    ("A transfer was recorded", "Transfer recorded on 12 October 2026."),
+    ("Transfer recorded...October 2026", "Transfer recorded on 12 October 2026."),
+])
+def test_quote_snippets_are_verbatim_source_or_rebuilt(case_client, endpoint, snippet, expected):
+    case_id, file = seed(case_client)
+    payload = reply(file["id"])
+    payload["summary"][0]["citations"][0]["snippet"] = snippet
+    mock_response(payload)
+    request = {"json": {"question": "What was recorded?"}} if endpoint == "chat" else {}
+    response = case_client.post(f"/api/cases/{case_id}/{endpoint}", **request)
+    assert response.status_code == 200
+    citation = response.json()["summary"][0]["citations"][0]
+    assert citation["snippet"] == expected
+    assert citation["evidence_file_id"] == file["id"]
+    assert response.json()["warnings"] == []
