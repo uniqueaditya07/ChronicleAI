@@ -15,18 +15,27 @@ const handlers = ['navigateToCase', 'fetchCaseDetail', 'fetchEvidenceList', 'fet
   'executeEvidenceSearch', 'handleTriggerAnalysis', 'handleOpenInspector',
   'handleVerifyIntegrity', 'handleSaveEdit', 'handleFileUpload', 'handleCreateCase',
   'handleClearEvidenceSearch', 'handleCopyHash', 'fetchStats', 'fetchCases',
-  'fetchTimeline', 'handleSendChat', 'clearChat', 'handleExportReport', 'setChatInput', 'apiError', 'formatTimestamp'];
+  'fetchTimeline', 'handleSendChat', 'clearChat', 'openChat', 'closeChat', 'handleChatComposerKeyDown', 'handleExportReport', 'setChatInput', 'apiError', 'formatTimestamp'];
 // Optional exports let these tests demonstrate failures against the old checkpoint too.
 const component = new Function('useState', 'useEffect', 'useRef', 'fetch', 'setTimeout',
-  'clearTimeout', 'AbortController', 'navigator', 'document', 'URL', body + '\nreturn { state: {' + names.join(',') +
+  'clearTimeout', 'AbortController', 'navigator', 'document', 'URL', 'useCallback', body + '\nreturn { state: {' + names.join(',') +
   '}, ' + handlers.join(',') + ', navigateToView: typeof navigateToView === "function" ? navigateToView : null,' +
   'closeInspector: typeof closeInspector === "function" ? closeInspector : null,' +
   'handleInspectorPageChange: typeof handleInspectorPageChange === "function" ? handleInspectorPageChange : null,' +
-  'lineRefs };');
+  'lineRefs, chatLauncherRef, chatComposerRef, chatTranscriptRef, chatStickToBottomRef };');
 
 function harness() {
   const states = [], refs = [], requests = [], timers = new Map(), downloads = [], revoked = [];
   let cursor = 0, refCursor = 0, timerId = 0, effects = [];
+  const listeners = new Map();
+  const document = {
+    activeElement: null,
+    addEventListener: (name, listener) => listeners.set(name, listener),
+    removeEventListener: (name, listener) => { if (listeners.get(name) === listener) listeners.delete(name); },
+    body: { appendChild() {} },
+    createElement: () => ({ click() { downloads.push({ href: this.href, download: this.download }); }, remove() {} }),
+    querySelector: () => ({ focus() { document.activeElement = 'inspector-close'; } }),
+  };
   const useState = initial => {
     const index = cursor++;
     if (!(index in states)) states[index] = initial;
@@ -39,8 +48,8 @@ function harness() {
     return component(useState, effect => effects.push(effect), useRef, fetch,
       fn => { timers.set(++timerId, fn); return timerId; }, id => timers.delete(id),
       AbortController, { clipboard: { writeText: async () => {} } },
-      { body: { appendChild() {} }, createElement: () => ({ click() { downloads.push({ href: this.href, download: this.download }); }, remove() {} }) },
-      { createObjectURL: () => 'blob:synthetic-report', revokeObjectURL: url => revoked.push(url) });
+      document,
+      { createObjectURL: () => 'blob:synthetic-report', revokeObjectURL: url => revoked.push(url) }, callback => callback);
   };
   const current = () => requests.findLast(request => !request.done);
   const finish = (request, data, mode = 'success') => {
@@ -66,7 +75,12 @@ function harness() {
     const isTarget = new Function('targetLineNumber', 'line', 'return ' + expression);
     return { scrolledLine, highlightedLines: ui.state.inspectedLines.filter(line => isTarget(ui.state.targetLineNumber, line)).map(line => line.line_number) };
   };
-  return { render, select, current, finish, requests, timers, unmount, mountInspectorLines, downloads, revoked };
+  const runEffect = fragment => {
+    const effect = effects.find(candidate => candidate.toString().includes(fragment));
+    assert.ok(effect, 'Expected effect: ' + fragment);
+    return effect();
+  };
+  return { render, select, current, finish, requests, timers, unmount, mountInspectorLines, downloads, revoked, document, listeners, runEffect };
 }
 const event = { preventDefault() {} };
 const tick = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
@@ -502,6 +516,7 @@ test('Inspector pagination: explicit foreign-case file metadata cannot open an I
 });
 
 const chatReply = caseId => ({ case_id: caseId, answer_status: 'grounded', message: 'Cited answer',
+  answer: { text: 'Documented transfer', citations: [{ evidence_file_id: 11, original_filename: 'large.txt', start_line: 2501, end_line: 2501 }] },
   summary: [{ statement: 'Documented transfer', citations: [{ evidence_file_id: 11, start_line: 2501, end_line: 2501 }] }],
   documented_observations: [], possible_interpretations: [], unresolved_questions: [], warnings: [] });
 function ask(h, question = 'What does the evidence say?') {
@@ -618,4 +633,240 @@ test('Case editing safely renders FastAPI validation-error arrays', async () => 
 test('Naive UTC timestamps and explicitly zoned timestamps represent the same local instant', () => {
   const ui = harness().render();
   assert.equal(ui.formatTimestamp('2026-10-12T10:00:00'), ui.formatTimestamp('2026-10-12T10:00:00Z'));
+});
+
+
+// Floating presentation must not change case/request identity or evidence grounding.
+test('Floating chat: open, close and reopen retain completed answers and unsent draft', async () => {
+  const h = harness(); h.select(101); h.render().openChat();
+  const pending = ask(h); h.finish(h.current(), chatReply(101)); await pending;
+  h.render().setChatInput('An unsent follow-up');
+  h.render().closeChat();
+  assert.equal(h.render().state.chatOpen, false);
+  h.render().openChat();
+  assert.equal(h.render().state.chatOpen, true);
+  assert.equal(h.render().state.chatInput, 'An unsent follow-up');
+  assert.equal(h.render().state.chatMessages[0].answer.case_id, 101);
+});
+
+test('Floating chat: closing during a request keeps it active and retains its late answer', async () => {
+  const h = harness(); h.select(101); h.render().openChat();
+  const pending = ask(h); const request = h.current(); h.render().closeChat();
+  assert.equal(request.options.signal.aborted, false);
+  assert.equal(h.render().state.chatLoading, true);
+  h.finish(request, chatReply(101)); await pending;
+  h.render().openChat();
+  assert.equal(h.render().state.chatMessages[0].answer.case_id, 101);
+});
+
+test('Floating chat: clear cancels a pending answer without closing the panel', async () => {
+  const h = harness(); h.select(101); h.render().openChat();
+  const pending = ask(h); const request = h.current(); h.render().setChatInput('Draft');
+  h.render().clearChat();
+  assert.equal(request.options.signal.aborted, true);
+  assert.equal(h.render().state.chatOpen, true);
+  assert.equal(h.render().state.chatInput, '');
+  h.finish(request, chatReply(101)); await pending;
+  assert.deepEqual(h.render().state.chatMessages, []);
+  const retry = ask(h); h.finish(h.current(), chatReply(101)); await retry;
+  assert.equal(h.render().state.chatMessages.length, 1);
+});
+
+test('Floating chat: switching cases or leaving the workspace closes and clears it', async () => {
+  const h = harness(); h.select(101); h.render().openChat();
+  const pending = ask(h); const request = h.current(); h.render().setChatInput('Case A draft');
+  h.select(202);
+  assert.equal(h.render().state.chatOpen, false);
+  assert.equal(h.render().state.chatInput, '');
+  assert.equal(request.options.signal.aborted, true);
+  h.finish(request, chatReply(101)); await pending;
+  assert.deepEqual(h.render().state.chatMessages, []);
+  h.render().openChat(); h.render().navigateToView('dashboard'); h.render().openChat();
+  assert.equal(h.render().state.chatOpen, false);
+});
+
+test('Floating chat: same-render duplicate submissions create exactly one request', async () => {
+  const h = harness(); h.select(101); h.render().setChatInput('Same question');
+  const ui = h.render(); const first = ui.handleSendChat(event); const request = h.current();
+  await ui.handleSendChat(event);
+  assert.equal(h.requests.length, 1);
+  assert.equal(request.options.signal.aborted, false);
+  h.finish(request, chatReply(101)); await first;
+  const retry = ask(h, 'Same question'); assert.equal(h.requests.length, 2);
+  h.finish(h.current(), chatReply(101)); await retry;
+});
+
+test('Floating chat: Enter sends, Shift+Enter and IME composition do not submit', async () => {
+  const h = harness(); h.select(101); h.render().setChatInput('Keyboard question');
+  let prevented = 0;
+  const key = extras => ({ key: 'Enter', shiftKey: false, preventDefault() { prevented++; }, ...extras });
+  h.render().handleChatComposerKeyDown(key({ shiftKey: true }));
+  h.render().handleChatComposerKeyDown(key({ nativeEvent: { isComposing: true } }));
+  assert.equal(h.requests.length, 0); assert.equal(prevented, 0);
+  h.render().handleChatComposerKeyDown(key({}));
+  assert.equal(h.requests.length, 1); assert.ok(prevented > 0);
+  h.finish(h.current(), chatReply(101)); await tick();
+  assert.equal(h.render().state.chatMessages[0].status, 'done');
+});
+
+test('Floating chat: timeout releases duplicate protection for the same question', async () => {
+  const h = harness(); h.select(101); const pending = ask(h, 'Retry me'); const request = h.current();
+  for (const timer of h.timers.values()) timer();
+  const error = new Error('aborted'); error.name = 'AbortError'; request.reject(error); await pending;
+  assert.match(h.render().state.chatError, /75 seconds/);
+  const retry = ask(h, 'Retry me'); assert.equal(h.requests.length, 2);
+  h.finish(h.current(), chatReply(101)); await retry;
+});
+
+test('Floating chat: evidence upload cancels and invalidates answers while closed', async () => {
+  const h = harness(); h.select(101); h.render().openChat();
+  const pending = ask(h); const request = h.current(); h.render().closeChat();
+  const uploading = h.render().handleFileUpload({ target: { files: [new File(['new'], 'new.txt')] } });
+  h.finish(h.current(), { line_count: 1, sha256_hash: 'a'.repeat(64) }); await uploading;
+  assert.equal(request.options.signal.aborted, true);
+  h.finish(request, chatReply(101)); await pending; h.render().openChat();
+  assert.deepEqual(h.render().state.chatMessages, []);
+  const retry = ask(h); h.finish(h.current(), chatReply(101)); await retry;
+  assert.equal(h.render().state.chatMessages.length, 1);
+});
+
+test('Floating chat: follow-ups send only the latest six completed user questions', async () => {
+  const h = harness(); h.select(101);
+  for (let index = 0; index < 8; index++) {
+    const pending = ask(h, 'Question ' + index); h.finish(h.current(), chatReply(101)); await pending;
+  }
+  const pending = ask(h, 'Next');
+  assert.deepEqual(JSON.parse(h.current().options.body).history,
+    Array.from({ length: 6 }, (_, index) => ({ case_id: 101, question: 'Question ' + (index + 2) })));
+  h.finish(h.current(), chatReply(101)); await pending;
+});
+
+test('Floating chat: focus entry, Escape and return to the opener', () => {
+  const h = harness(); h.select(101);
+  const opener = { isConnected: true, focus() { h.document.activeElement = this; } };
+  const composer = { focus() { h.document.activeElement = this; } };
+  h.document.activeElement = opener; h.render().chatComposerRef.current = composer;
+  h.render().openChat(); h.render(); h.runEffect('if (chatOpen)');
+  assert.equal(h.document.activeElement, composer);
+  const cleanup = h.runEffect('const onEscape');
+  h.listeners.get('keydown')({ key: 'Escape', preventDefault() {} });
+  assert.equal(h.render().state.chatOpen, false);
+  h.runEffect('if (chatOpen)');
+  assert.equal(h.document.activeElement, opener);
+  cleanup(); assert.equal(h.listeners.has('keydown'), false);
+});
+
+test('Floating chat: citation opens distant Inspector page and returns focus to the citation', async () => {
+  const h = harness(); h.select(101); h.render().openChat();
+  const pending = ask(h); h.finish(h.current(), chatReply(101)); await pending;
+  const citation = h.render().state.chatMessages[0].answer.answer.citations[0];
+  const button = { isConnected: true, focus() { h.document.activeElement = this; } };
+  h.document.activeElement = button;
+  assert.match(source, /<ChatAnswer answer=\{message.answer\} onOpen=\{handleOpenInspector\}/);
+  const expression = source.match(/onOpen\(citation, citation\.start_line\)/)[0];
+  const opening = new Function('onOpen', 'citation', 'return ' + expression)(h.render().handleOpenInspector, citation);
+  assert.equal(requestedPage(h.current()), 2);
+  h.finish(h.current(), pageResponse(2)); await opening;
+  assert.deepEqual(h.mountInspectorLines(), { scrolledLine: 2501, highlightedLines: [2501] });
+  const restoreFocus = h.runEffect('const previousFocus');
+  assert.equal(h.document.activeElement, 'inspector-close');
+  h.render().closeChat(); assert.equal(h.render().state.chatOpen, true, 'Inspector takes priority');
+  assert.equal(h.runEffect('const onEscape'), undefined);
+  h.render().closeInspector(); h.render(); restoreFocus();
+  assert.equal(h.document.activeElement, button);
+});
+
+test('Floating chat: scrolling does not pull the reader away from earlier messages', () => {
+  const h = harness(); h.select(101); h.render().openChat();
+  const transcript = { scrollTop: 0, scrollHeight: 900, clientHeight: 300 };
+  h.render().chatTranscriptRef.current = transcript;
+  h.runEffect('const transcript'); assert.equal(transcript.scrollTop, 900);
+  transcript.scrollTop = 50; h.render().chatStickToBottomRef.current = false;
+  h.runEffect('const transcript'); assert.equal(transcript.scrollTop, 50);
+});
+
+const presentationStart = source.indexOf('function buildChatPresentation(');
+const presentationEnd = source.indexOf('function ChatAnswer(', presentationStart);
+const presentChat = new Function(source.slice(presentationStart, presentationEnd) + '\nreturn buildChatPresentation;')();
+const presentationCitation = { evidence_file_id: 3, original_filename: 'payment.txt', start_line: 11, end_line: 13, snippet: 'entered the transaction' };
+const explicitChat = (text, overrides = {}) => ({ answer_status: 'grounded', answer: { text, citations: [presentationCitation] }, ...overrides });
+
+test('Chat presentation: explicit answer wins over a validly cited irrelevant recap', () => {
+  const recap = { statement: 'Ten laptops were ordered and eight were received.', citations: [presentationCitation] };
+  const text = 'The payment record does not identify an approver. It identifies the clerk who entered the transaction.';
+  const response = explicitChat(text, { summary: [recap], documented_observations: [recap], unresolved_questions: ['Who approved it?'] });
+  const original = structuredClone(response); const view = presentChat(response);
+  assert.deepEqual(view.direct, [{ statement: text, citations: [presentationCitation] }]);
+  assert.deepEqual(view.observations, [recap]);
+  assert.deepEqual(response, original);
+});
+
+test('Chat presentation: supporting duplicate facts merge citations without changing primary citations', () => {
+  const other = { ...presentationCitation, evidence_file_id: 8, original_filename: 'notes.txt' };
+  const fact = { statement: 'Supporting statement.', citations: [presentationCitation] };
+  const view = presentChat(explicitChat('The direct answer.', { summary: [fact], documented_observations: [{ ...fact, citations: [other] }] }));
+  assert.deepEqual(view.direct[0].citations, [presentationCitation]);
+  assert.deepEqual(view.observations[0].citations, [presentationCitation, other]);
+});
+
+for (const invalid of [undefined, null, {}, { text: '', citations: [] }, { text: 'Uncited claim', citations: [] },
+  { text: 'Bad source', citations: [null] }, { text: 'Coerced line', citations: [{ ...presentationCitation, start_line: '11' }] }]) {
+  test('Chat presentation: malformed primary never promotes a supporting summary: ' + JSON.stringify(invalid), () => {
+    const recap = { statement: 'An unrelated case recap.', citations: [presentationCitation] };
+    const view = presentChat({ answer_status: 'grounded', answer: invalid, summary: [recap], documented_observations: [recap] });
+    assert.deepEqual(view.direct, []); assert.deepEqual(view.observations, [recap]);
+    assert.equal(view.directInterpretation, false);
+  });
+}
+
+test('Chat presentation: observations and interpretations cannot become a missing primary answer', () => {
+  const claim = { statement: 'A possible explanation.', citations: [presentationCitation] };
+  const view = presentChat({ answer_status: 'interpretation_only', documented_observations: [claim], possible_interpretations: [claim] });
+  assert.deepEqual(view.direct, []); assert.deepEqual(view.observations, [claim]); assert.deepEqual(view.interpretations, [claim]);
+  assert.equal(view.directInterpretation, false);
+});
+
+test('Chat presentation: insufficient evidence may have an explicit uncited explanation despite cited supporting facts', () => {
+  const text = 'The evidence does not establish who approved the payment.';
+  const view = presentChat(explicitChat(text, { answer_status: 'insufficient_evidence', answer: { text, citations: [] },
+    summary: [{ statement: 'A payment occurred.', citations: [presentationCitation] }] }));
+  assert.deepEqual(view.direct, [{ statement: text, citations: [] }]); assert.equal(view.observations.length, 1);
+});
+
+test('Chat presentation: interpretation-only answer stays labelled and does not borrow evidence', () => {
+  const view = presentChat(explicitChat('It may indicate a documentation gap.', { answer_status: 'interpretation_only' }));
+  assert.equal(view.directInterpretation, true); assert.equal(view.direct.length, 1);
+  assert.deepEqual(view.direct[0].citations, [presentationCitation]);
+});
+
+test('Chat presentation: detailed primary answers are not truncated or concatenated with supporting claims', () => {
+  const text = 'First relevant sentence. Second qualification. Third detail. Fourth requested detail.';
+  const response = explicitChat(text, { summary: [{ statement: 'Background.', citations: [presentationCitation] }], unresolved_questions: ['Who authorized it?'] });
+  const view = presentChat(response);
+  assert.equal(view.direct[0].statement, text); assert.equal(view.direct.length, 1);
+  assert.equal(view.observations[0].statement, 'Background.');
+  assert.match(source, /A validated answer was not returned/);
+});
+
+test('Floating chat: launcher hides on open and returns on close with draft, conversation and focus intact', async () => {
+  // Evaluate the actual hidden binding, using the same handler state as React.
+  const binding = source.match(/className="chat-launcher"[^>]*hidden=\{([^}]+)\}/)[1];
+  const launcherHidden = new Function('chatOpen', 'return ' + binding);
+  const css = readFileSync(new URL('../src/App.css', import.meta.url), 'utf8');
+  assert.match(css, /\.chat-launcher\[hidden\]\s*\{\s*display:\s*none;/);
+  const h = harness(); h.select(101);
+  const launcher = { isConnected: true, focus() { h.document.activeElement = this; } };
+  const composer = { focus() { h.document.activeElement = this; } };
+  h.document.activeElement = launcher;
+  h.render().chatLauncherRef.current = launcher; h.render().chatComposerRef.current = composer;
+  assert.equal(launcherHidden(h.render().state.chatOpen), false);
+  h.render().openChat(); h.render(); h.runEffect('if (chatOpen)');
+  assert.equal(launcherHidden(h.render().state.chatOpen), true);
+  const pending = ask(h); h.finish(h.current(), chatReply(101)); await pending;
+  h.render().setChatInput('Unsent follow-up'); h.render().closeChat(); h.render(); h.runEffect('if (chatOpen)');
+  assert.equal(launcherHidden(h.render().state.chatOpen), false);
+  assert.equal(h.document.activeElement, launcher);
+  h.render().openChat();
+  assert.equal(h.render().state.chatInput, 'Unsent follow-up');
+  assert.equal(h.render().state.chatMessages.length, 1);
 });

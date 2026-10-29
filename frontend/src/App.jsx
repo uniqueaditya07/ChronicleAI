@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import './App.css';
 
 // Helper component to highlight matching search text safely without dangerouslySetInnerHTML
@@ -40,6 +40,69 @@ function EvidenceCitations({ citations, onOpen }) {
       {citation.original_filename}: L{citation.start_line}{citation.end_line !== citation.start_line ? `–${citation.end_line}` : ''} &rarr;
     </button>
   ))}</div>;
+}
+
+// Presentation only: merge exact duplicate claims without dropping source metadata.
+function buildChatPresentation(answer) {
+  const validCitation = citation => citation && Number.isSafeInteger(citation.evidence_file_id)
+    && citation.evidence_file_id > 0 && typeof citation.original_filename === 'string'
+    && Number.isSafeInteger(citation.start_line) && citation.start_line >= 1
+    && Number.isSafeInteger(citation.end_line) && citation.end_line >= citation.start_line;
+  const merge = claims => {
+    const grouped = new Map();
+    for (const claim of claims) {
+      if (!claim || typeof claim.statement !== 'string' || !Array.isArray(claim.citations)
+          || !claim.citations.every(validCitation)) continue;
+      const identity = `${claim.classification || 'documented_observation'}:${claim.statement.trim()}`;
+      const previous = grouped.get(identity);
+      const citations = [...(previous?.citations || []), ...claim.citations];
+      grouped.set(identity, { ...claim, citations: [...new Map(citations.map(citation => [JSON.stringify(citation), citation])).values()] });
+    }
+    return [...grouped.values()];
+  };
+  const items = value => Array.isArray(value) ? value : [];
+  const primary = answer.answer;
+  const knownStatus = ['grounded', 'interpretation_only', 'insufficient_evidence'].includes(answer.answer_status);
+  const validPrimary = knownStatus && primary && typeof primary.text === 'string' && primary.text.trim()
+    && Array.isArray(primary.citations) && primary.citations.every(validCitation)
+    && (answer.answer_status === 'insufficient_evidence' || primary.citations.length > 0);
+  return {
+    // Only the dedicated object can be primary. Never borrow supporting text or citations.
+    direct: validPrimary ? [{ statement: primary.text, citations: primary.citations }] : [],
+    directInterpretation: !!validPrimary && answer.answer_status === 'interpretation_only',
+    observations: merge([...items(answer.summary), ...items(answer.documented_observations)]),
+    interpretations: merge(items(answer.possible_interpretations)),
+  };
+}
+
+function ChatAnswer({ answer, onOpen }) {
+  const presentation = buildChatPresentation(answer);
+  const claims = items => items.map((claim, index) => (
+    <div className="chat-claim" key={index}>
+      <p>{claim.statement}</p>
+      <EvidenceCitations citations={claim.citations} onOpen={onOpen} />
+    </div>
+  ));
+  return <>
+    {presentation.direct.length === 0 && <p className="chat-answer-notice">A validated answer was not returned. Please try again.</p>}
+    {presentation.direct.length > 0 && answer.answer_status === 'insufficient_evidence' && <p className="chat-uncertainty">Evidence limitation</p>}
+    {presentation.directInterpretation && <p className="chat-uncertainty">Tentative interpretation · not an established fact</p>}
+    {claims(presentation.direct)}
+    {[
+      ['Supporting details', presentation.observations],
+      ['Possible interpretations · not established facts', presentation.interpretations],
+    ].map(([heading, items]) => items.length > 0 && (
+      <details className="chat-details" key={heading}><summary>{heading} ({items.length})</summary>{claims(items)}</details>
+    ))}
+    {answer.unresolved_questions?.length > 0 && <details className="chat-details">
+      <summary>Unresolved questions ({answer.unresolved_questions.length})</summary>
+      <ul>{answer.unresolved_questions.map((question, index) => <li key={index}>{question}</li>)}</ul>
+    </details>}
+    {answer.warnings?.length > 0 && <details className="chat-details chat-quality-notice">
+      <summary>Citation quality notices ({answer.warnings.length})</summary>
+      <ul>{answer.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul>
+    </details>}
+  </>;
 }
 
 function App() {
@@ -107,6 +170,13 @@ function App() {
   const [chatLoading, setChatLoading] = useState(false);
   const [chatError, setChatError] = useState(null);
   const chatSequence = useRef(0);
+  const [chatOpen, setChatOpen] = useState(false);
+  const chatLauncherRef = useRef(null);
+  const chatComposerRef = useRef(null);
+  const chatTranscriptRef = useRef(null);
+  const chatReturnFocusRef = useRef(null);
+  const chatStickToBottomRef = useRef(true);
+  const chatPendingQuestionRef = useRef(null);
   const [timelineData, setTimelineData] = useState(null);
   const [timelineLoading, setTimelineLoading] = useState(false);
   const [timelineError, setTimelineError] = useState(null);
@@ -140,6 +210,7 @@ function App() {
   const [copySuccess, setCopySuccess] = useState(false);
   const [targetLineNumber, setTargetLineNumber] = useState(null);
   const lineRefs = useRef({});
+  const inspectorReturnFocusRef = useRef(null);
 
   // Ref identity changes synchronously on navigation, before React's next render.
   // Abort is best-effort; identity checks remain authoritative after every await.
@@ -186,6 +257,14 @@ function App() {
     lineRefs.current = {};
   };
 
+  useEffect(() => {
+    if (!inspectedFile) return;
+    const previousFocus = inspectorReturnFocusRef.current || document.activeElement;
+    inspectorReturnFocusRef.current = null;
+    document.querySelector?.('[aria-label="Close Evidence Inspector"]')?.focus();
+    return () => { if (previousFocus?.isConnected) previousFocus.focus(); };
+  }, [inspectedFile]);
+
   const resetCaseState = () => {
     setCurrentCase(null);
     setCaseError(null);
@@ -212,6 +291,9 @@ function App() {
     setAnalysisData(null);
     setAnalysisLoading(false);
     setAnalysisError(null);
+    setChatOpen(false);
+    chatReturnFocusRef.current = null;
+    chatPendingQuestionRef.current = null;
     setChatInput('');
     setChatMessages([]);
     setChatLoading(false);
@@ -408,12 +490,8 @@ function App() {
       if (!request.isCurrent()) return;
       if (res.ok) {
         setEntitiesData(data);
-        // Expand first 5 entities by default so investigator sees provenance citations immediately
-        const initialExpanded = {};
-        (data.entities || []).slice(0, 5).forEach((ent) => {
-          initialExpanded[`${ent.category}_${ent.display_text}`] = true;
-        });
-        setExpandedEntities(initialExpanded);
+        // Keep provenance available on demand without expanding long groups.
+        setExpandedEntities({});
       } else {
         setEntitiesError(apiError(data.detail, 'Failed to extract named entities.'));
       }
@@ -631,6 +709,7 @@ function App() {
     if (results.some(result => result.status === 'success')) {
       cancelRequest('analysis');
       cancelRequest('chat');
+      chatPendingQuestionRef.current = null;
       cancelRequest('report');
       setAnalysisData(null);
       setAnalysisLoading(false);
@@ -696,6 +775,7 @@ function App() {
     const caseId = fileOrMeta.case_id || selectedCaseId;
     if (!isActiveCase(caseId)) return;
     closeInspector();
+    inspectorReturnFocusRef.current = document.activeElement;
     const file = evidenceFiles.find((item) => item.id === evidenceId) || {
       id: evidenceId,
       case_id: caseId,
@@ -831,8 +911,29 @@ function App() {
     }
   };
 
+  const openChat = () => {
+    if (!isActiveCase(selectedCaseId) || inspectedFile) return;
+    if (!chatOpen) chatReturnFocusRef.current = document.activeElement;
+    chatStickToBottomRef.current = true;
+    setChatOpen(true);
+    chatComposerRef.current?.focus();
+  };
+
+  const closeChat = useCallback(() => {
+    if (inspectedFile) return;
+    setChatOpen(false);
+  }, [inspectedFile]);
+
+  const handleChatComposerKeyDown = (event) => {
+    if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent?.isComposing && !event.isComposing) {
+      event.preventDefault();
+      if (!chatLoading && chatInput.trim()) void handleSendChat(event);
+    }
+  };
+
   const clearChat = () => {
     cancelRequest('chat');
+    chatPendingQuestionRef.current = null;
     setChatMessages([]);
     setChatInput('');
     setChatLoading(false);
@@ -844,6 +945,9 @@ function App() {
     if (!isActiveCase(selectedCaseId)) return;
     const question = chatInput.trim();
     if (!question) { setChatError('Enter a question about this case.'); return; }
+    if (chatPendingQuestionRef.current === question) return;
+    chatPendingQuestionRef.current = question;
+    chatStickToBottomRef.current = true;
     const request = beginRequest('chat');
     const id = ++chatSequence.current;
     const history = chatMessages.filter(message => message.case_id === selectedCaseId && message.answer)
@@ -870,7 +974,10 @@ function App() {
       setChatMessages(previous => previous.map(message => message.id === id ? { ...message, status: 'error' } : message));
     } finally {
       clearTimeout(timeout);
-      if (request.isCurrent()) setChatLoading(false);
+      if (request.isCurrent()) {
+        chatPendingQuestionRef.current = null;
+        setChatLoading(false);
+      }
     }
   };
 
@@ -905,12 +1012,36 @@ function App() {
     }
   };
 
+  useEffect(() => {
+    if (chatOpen) chatComposerRef.current?.focus();
+    else if (chatReturnFocusRef.current) {
+      // Wait until React has revealed the launcher before returning focus.
+      const opener = chatReturnFocusRef.current;
+      if (opener.isConnected) opener.focus();
+      else chatLauncherRef.current?.focus();
+    }
+  }, [chatOpen]);
+
+  useEffect(() => {
+    if (!chatOpen || inspectedFile) return;
+    const onEscape = event => {
+      if (event.key === 'Escape') { event.preventDefault(); closeChat(); }
+    };
+    document.addEventListener?.('keydown', onEscape);
+    return () => document.removeEventListener?.('keydown', onEscape);
+  }, [chatOpen, inspectedFile, closeChat]);
+
+  useEffect(() => {
+    const transcript = chatTranscriptRef.current;
+    if (chatOpen && !inspectedFile && transcript && chatStickToBottomRef.current) transcript.scrollTop = transcript.scrollHeight;
+  }, [chatOpen, chatMessages, inspectedFile]);
+
   return (
     <div className="app-container">
       {/* Header */}
       <header className="header">
         <div className="brand-group">
-          <div className="logo" onClick={() => navigateToView('dashboard')}>ChronicleAI</div>
+          <button type="button" className="logo" onClick={() => navigateToView('dashboard')}>ChronicleAI</button>
           <span className="platform-tag">Digital Evidence System</span>
         </div>
         <nav className="nav-links">
@@ -942,7 +1073,7 @@ function App() {
       </header>
 
       {/* Main Body */}
-      <main className="main-content">
+      <main className={`main-content ${currentView === 'case-detail' ? 'has-case-assistant' : ''}`}>
         {/* DASHBOARD VIEW */}
         {currentView === 'dashboard' && (
           <div className="view-container">
@@ -1192,7 +1323,7 @@ function App() {
         {currentView === 'case-detail' && (
           <div className="view-container">
             <div className="breadcrumb">
-              <span className="crumb-link" onClick={() => navigateToView('cases')}>Cases</span>
+              <button type="button" className="crumb-link" onClick={() => navigateToView('cases')}>Cases</button>
               <span className="crumb-separator">/</span>
               <span className="crumb-current">{currentCase ? currentCase.case_number : 'Case Detail'}</span>
             </div>
@@ -1203,8 +1334,20 @@ function App() {
               <div className="alert-banner error">{caseError}</div>
             ) : currentCase ? (
               <div className="case-detail-layout">
+                <nav className="case-section-nav" aria-label="Case detail sections">
+                  {[
+                    ['overview', 'Overview'], ['evidence', 'Evidence'], ['search', 'Search'],
+                    ['entities', 'Entities'], ['timeline', 'Timeline'], ['analysis', 'Gemini Analysis'],
+                    ['chat', 'Ask This Case'], ['report', 'Report'],
+                  ].map(([id, label], index) => (
+                    id === 'chat' ? <button key={id} type="button" onClick={openChat} aria-controls="case-chat-panel" aria-expanded={chatOpen}>
+                      <span>{String(index + 1).padStart(2, '0')}</span>{label}
+                    </button> : <a key={id} href={`#case-${id}`}><span>{String(index + 1).padStart(2, '0')}</span>{label}</a>
+                  ))}
+                </nav>
                 {/* Main Case Info Card */}
-                <div className="detail-card">
+                <div className="detail-card" id="case-overview" role="region" aria-label="Case Overview">
+                  <p className="section-eyebrow">01 / Case Overview</p>
                   <div className="detail-card-header">
                     <div>
                       <div className="detail-meta-top">
@@ -1285,8 +1428,105 @@ function App() {
                   )}
                 </div>
 
-                {/* PHASE 3: EVIDENCE SEARCH SECTION */}
-                <div className="detail-card search-section">
+                {/* Evidence Section (Phase 2 Upload & Registry) */}
+                <div className="detail-card evidence-section" id="case-evidence" role="region" aria-label="Evidence Management">
+                  <div className="evidence-section-header">
+                    <div>
+                      <h2>Evidence Management</h2>
+                      <p className="section-subtext">Original text evidence preservation and line-level index</p>
+                    </div>
+
+                    <div className="evidence-upload-controls">
+                      <input
+                        type="file"
+                        ref={fileInputRef}
+                        onChange={handleFileUpload}
+                        accept=".txt,text/plain"
+                        multiple
+                        style={{ display: 'none' }}
+                        id="evidence-file-input"
+                      />
+                      <button type="button" onClick={() => fileInputRef.current?.click()} className="btn-primary upload-label">
+                        + Ingest TXT Evidence
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Upload Progress & Results Notification */}
+                  {uploadProgress && (
+                    <div className="alert-banner info">{uploadProgress}</div>
+                  )}
+                  {uploadResults.length > 0 && (
+                    <div className="upload-results-panel">
+                      <div className="results-header">
+                        <span>Ingestion Results ({uploadResults.length} file{uploadResults.length > 1 ? 's' : ''})</span>
+                        <button className="btn-text" onClick={() => setUploadResults([])}>Dismiss</button>
+                      </div>
+                      <div className="results-list">
+                        {uploadResults.map((r, i) => (
+                          <div key={i} className={`result-row ${r.status}`}>
+                            <span className="result-name">{r.name}</span>
+                            <span className="result-msg">{r.message}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {evidenceError && <div className="alert-banner error">{evidenceError}</div>}
+
+                  {/* Evidence Table */}
+                  {evidenceLoading ? (
+                    <div className="loading-state">Loading evidence records...</div>
+                  ) : evidenceFiles.length === 0 ? (
+                    <div className="empty-card evidence-empty">
+                      <div className="evidence-empty-icon">&#128196;</div>
+                      <h3>No Evidence Ingested for this Case</h3>
+                      <p>Upload text files (.txt, max 5 MB per file). Original file bytes will be cryptographically preserved, hashed with SHA-256, and indexed line-by-line.</p>
+                      <button type="button" onClick={() => fileInputRef.current?.click()} className="btn-primary upload-label">
+                        Ingest First File
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="table-wrapper">
+                      <table className="data-table">
+                        <thead>
+                          <tr>
+                            <th>Evidence File</th>
+                            <th>Size</th>
+                            <th>SHA-256 Hash</th>
+                            <th>Lines</th>
+                            <th>Uploaded (local time)</th>
+                            <th>Action</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {evidenceFiles.map((ev) => (
+                            <tr key={ev.id}>
+                              <td className="case-title-cell font-bold">{ev.original_filename}</td>
+                              <td>{(ev.file_size / 1024).toFixed(1)} KB</td>
+                              <td className="mono-cell">
+                                <span title={ev.sha256_hash}>
+                                  {ev.sha256_hash.substring(0, 16)}...
+                                </span>
+                              </td>
+                              <td>{ev.line_count.toLocaleString()}</td>
+                              <td>{formatTimestamp(ev.uploaded_at)}</td>
+                              <td>
+                                <button className="btn-table-action" onClick={() => handleOpenInspector(ev)}>
+                                  Inspect Evidence
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+
+                {/* Cross-file search preserves its existing request and pagination behavior. */}
+                <div className="detail-card search-section" id="case-search" role="region" aria-label="Cross-File Evidence Search">
                   <div className="search-section-header">
                     <div>
                       <h2>Cross-File Evidence Search</h2>
@@ -1398,7 +1638,7 @@ function App() {
                 </div>
 
                 {/* PHASE 4: NAMED ENTITY EXPLORER */}
-                <div className="detail-card entity-section">
+                <div className="detail-card entity-section" id="case-entities" role="region" aria-label="Named Entity Explorer">
                   <div className="entity-section-header">
                     <div>
                       <h2>Named Entity Explorer</h2>
@@ -1534,9 +1774,6 @@ function App() {
                               <div key={idx} className="entity-card">
                                 <div
                                   className="entity-card-header"
-                                  onClick={() => toggleEntityExpand(key)}
-                                  role="button"
-                                  tabIndex={0}
                                 >
                                   <div className="entity-card-main">
                                     <span className={`entity-category-badge badge-${entity.category.toLowerCase()}`}>
@@ -1550,6 +1787,9 @@ function App() {
                                   <button
                                     type="button"
                                     className="btn-expand-toggle"
+                                    onClick={() => toggleEntityExpand(key)}
+                                    aria-expanded={isExpanded}
+                                    aria-controls={`entity-provenance-${idx}`}
                                     aria-label={isExpanded ? 'Collapse provenance' : 'Expand provenance'}
                                   >
                                     {isExpanded ? '▲ Hide Citations' : '▼ View Citations'}
@@ -1557,9 +1797,9 @@ function App() {
                                 </div>
 
                                 {isExpanded && (
-                                  <div className="entity-occurrences-drawer">
+                                  <div className="entity-occurrences-drawer" id={`entity-provenance-${idx}`}>
                                     <div className="occurrences-header">
-                                      <span>Evidence Provenance Citations:</span>
+                                      <span>Evidence provenance · {entity.occurrences.length} citations</span>
                                     </div>
                                     <div className="occurrences-list">
                                       {entity.occurrences.map((occ, occIdx) => {
@@ -1634,12 +1874,45 @@ function App() {
                   )}
                 </div>
 
-                {/* PHASE 5: AI EVIDENCE-GROUNDED CASE ANALYSIS */}
-                <div className="detail-card ai-analysis-section">
+                {/* Evidence-linked timeline with bounded disclosure groups. */}
+                <section className="detail-card" id="case-timeline" aria-label="Evidence-linked timeline">
+                  <div className="detail-card-header">
+                    <div><h2>Evidence-Linked Timeline</h2><p className="section-subtext">Dated statements and their original evidence lines</p></div>
+                    <button className="btn-secondary" disabled={timelineLoading} onClick={() => fetchTimeline(selectedCaseId)}>Refresh Timeline</button>
+                  </div>
+                  {timelineLoading && <div className="loading-state">Reading dates from indexed evidence…</div>}
+                  {timelineError && <div className="alert-banner error" role="alert">{timelineError}</div>}
+                  {!timelineLoading && timelineData && <>
+                    <p className="section-subtext">{timelineData.disclaimer}</p>
+                    {[
+                      ['events', 'Chronological dated statements'], ['undated', 'Ambiguous, incomplete or invalid date mentions'],
+                    ].map(([section, heading]) => timelineData[section].length > 0 && (
+                      <div key={section} className="timeline-group"><h3>{heading} <span className="record-count">{timelineData[section].length} records</span></h3>
+                        {Array.from({ length: Math.ceil(timelineData[section].length / 10) }, (_, group) => (
+                          <details className="timeline-batch" key={group} open={group === 0}>
+                            <summary>Records {group * 10 + 1}–{Math.min((group + 1) * 10, timelineData[section].length)} of {timelineData[section].length}</summary>
+                            {timelineData[section].slice(group * 10, (group + 1) * 10).map((entry, index) => (
+                              <article className="ai-claim-card" key={index}>
+                                <strong>{entry.normalized_date || entry.date_text}</strong>{' '}
+                                <span className="badge-section-type">{entry.date_status}</span>
+                                <p>{entry.description}</p><p className="section-subtext">{entry.note}</p>
+                                <EvidenceCitations citations={entry.citations} onOpen={handleOpenInspector} />
+                              </article>
+                            ))}
+                          </details>
+                        ))}
+                      </div>
+                    ))}
+                    {timelineData.events.length === 0 && timelineData.undated.length === 0 && <p className="empty-subtext">No supported date mentions found. Upload evidence containing explicit dates to populate the timeline.</p>}
+                  </>}
+                </section>
+
+                {/* Gemini analysis retains all existing claims, notices and citations. */}
+                <div className="detail-card ai-analysis-section" id="case-analysis" role="region" aria-label="Gemini AI Case Analysis">
                   <div className="ai-analysis-header">
                     <div className="ai-header-titles">
                       <div className="ai-title-badge-row">
-                        <h2>AI Case Analysis</h2>
+                        <h2>Gemini AI Case Analysis</h2>
                         <span className="badge-ai-model">Gemini Powered</span>
                       </div>
                       <p className="section-subtext">Evidence-grounded synthesis, observations, and structured provenance</p>
@@ -1868,73 +2141,7 @@ function App() {
                   )}
                 </div>
 
-                <section className="detail-card" aria-label="Case-specific AI chat">
-                  <div className="detail-card-header">
-                    <div><h2>Ask This Case</h2><p className="section-subtext">Evidence-grounded questions and follow-ups with source citations</p></div>
-                    <button className="btn-secondary" onClick={clearChat} disabled={chatMessages.length === 0}>Clear Conversation</button>
-                  </div>
-                  <p className="section-subtext">Uses Google Gemini. Conversation stays in this case view and clears when you leave. Previous questions provide context, never evidence.</p>
-                  <form className="search-bar" onSubmit={handleSendChat}>
-                    <input className="search-input-field" aria-label="Question about this case" maxLength={2000}
-                      placeholder="What does the evidence say about the payment approval?"
-                      value={chatInput} onChange={event => setChatInput(event.target.value)} />
-                    <button className="btn-primary" disabled={chatLoading || !chatInput.trim()}>{chatLoading ? 'Answering…' : 'Ask Case'}</button>
-                  </form>
-                  {chatError && <div className="alert-banner error" role="alert">{chatError}</div>}
-                  {chatMessages.length === 0 && <p className="empty-subtext">Ask a question after uploading evidence. Unsupported questions will be acknowledged without an invented answer.</p>}
-                  <div aria-live="polite">
-                    {chatMessages.map(message => (
-                      <article key={message.id} className="ai-section-block">
-                        <h3>You asked: {message.question}</h3>
-                        {message.status === 'pending' && <p>Reading this case’s indexed evidence…</p>}
-                        {message.status === 'error' && <p>No answer returned. You can ask again.</p>}
-                        {message.answer && <>
-                          <p className={message.answer.answer_status === 'grounded' ? 'section-subtext' : 'alert-banner warning'}>{message.answer.message}</p>
-                          {[
-                            ['summary', 'Answer summary — statements about evidence'],
-                            ['documented_observations', 'Documented observations'],
-                            ['possible_interpretations', 'Possible interpretations — not established facts'],
-                          ].map(([section, heading]) => message.answer[section]?.length > 0 && (
-                            <div key={section}><h4>{heading}</h4>{message.answer[section].map((claim, index) => (
-                              <div key={index} className="ai-claim-card"><p>{claim.statement}</p>
-                                <EvidenceCitations citations={claim.citations} onOpen={handleOpenInspector} />
-                              </div>
-                            ))}</div>
-                          ))}
-                          {message.answer.unresolved_questions?.length > 0 && <><h4>Unresolved questions</h4><ul>{message.answer.unresolved_questions.map((question, index) => <li key={index}>{question}</li>)}</ul></>}
-                          {message.answer.warnings?.length > 0 && <div className="ai-warnings-box"><strong>Citation quality notices</strong><ul>{message.answer.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul></div>}
-                        </>}
-                      </article>
-                    ))}
-                  </div>
-                </section>
-
-                <section className="detail-card" aria-label="Evidence-linked timeline">
-                  <div className="detail-card-header">
-                    <div><h2>Evidence-Linked Timeline</h2><p className="section-subtext">Dated statements and their original evidence lines</p></div>
-                    <button className="btn-secondary" disabled={timelineLoading} onClick={() => fetchTimeline(selectedCaseId)}>Refresh Timeline</button>
-                  </div>
-                  {timelineLoading && <div className="loading-state">Reading dates from indexed evidence…</div>}
-                  {timelineError && <div className="alert-banner error" role="alert">{timelineError}</div>}
-                  {!timelineLoading && timelineData && <>
-                    <p className="section-subtext">{timelineData.disclaimer}</p>
-                    {[
-                      ['events', 'Chronological dated statements'], ['undated', 'Ambiguous, incomplete or invalid date mentions'],
-                    ].map(([section, heading]) => timelineData[section].length > 0 && (
-                      <div key={section}><h3>{heading}</h3>{timelineData[section].map((entry, index) => (
-                        <article className="ai-claim-card" key={index}>
-                          <strong>{entry.normalized_date || entry.date_text}</strong>{' '}
-                          <span className="badge-section-type">{entry.date_status}</span>
-                          <p>{entry.description}</p><p className="section-subtext">{entry.note}</p>
-                          <EvidenceCitations citations={entry.citations} onOpen={handleOpenInspector} />
-                        </article>
-                      ))}</div>
-                    ))}
-                    {timelineData.events.length === 0 && timelineData.undated.length === 0 && <p className="empty-subtext">No supported date mentions found. Upload evidence containing explicit dates to populate the timeline.</p>}
-                  </>}
-                </section>
-
-                <section className="detail-card" aria-label="Investigation report">
+                <section className="detail-card" id="case-report" aria-label="Investigation report">
                   <div className="detail-card-header">
                     <div><h2>Investigation Report</h2><p className="section-subtext">Case details, evidence hashes and integrity checks, timeline, AI observations, interpretations, questions and cited excerpts.</p></div>
                     <button className="btn-primary" onClick={handleExportReport} disabled={reportLoading || analysisLoading || uploadProgress !== null}>
@@ -1946,102 +2153,7 @@ function App() {
                   {reportError && <div className="alert-banner error" role="alert">{reportError}</div>}
                 </section>
 
-                {/* Evidence Section (Phase 2 Upload & Registry) */}
-                <div className="detail-card evidence-section">
-                  <div className="evidence-section-header">
-                    <div>
-                      <h2>Case Evidence Records</h2>
-                      <p className="section-subtext">Original text evidence preservation and line-level index</p>
-                    </div>
 
-                    <div className="evidence-upload-controls">
-                      <input
-                        type="file"
-                        ref={fileInputRef}
-                        onChange={handleFileUpload}
-                        accept=".txt,text/plain"
-                        multiple
-                        style={{ display: 'none' }}
-                        id="evidence-file-input"
-                      />
-                      <label htmlFor="evidence-file-input" className="btn-primary upload-label">
-                        + Ingest TXT Evidence
-                      </label>
-                    </div>
-                  </div>
-
-                  {/* Upload Progress & Results Notification */}
-                  {uploadProgress && (
-                    <div className="alert-banner info">{uploadProgress}</div>
-                  )}
-                  {uploadResults.length > 0 && (
-                    <div className="upload-results-panel">
-                      <div className="results-header">
-                        <span>Ingestion Results ({uploadResults.length} file{uploadResults.length > 1 ? 's' : ''})</span>
-                        <button className="btn-text" onClick={() => setUploadResults([])}>Dismiss</button>
-                      </div>
-                      <div className="results-list">
-                        {uploadResults.map((r, i) => (
-                          <div key={i} className={`result-row ${r.status}`}>
-                            <span className="result-name">{r.name}</span>
-                            <span className="result-msg">{r.message}</span>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {evidenceError && <div className="alert-banner error">{evidenceError}</div>}
-
-                  {/* Evidence Table */}
-                  {evidenceLoading ? (
-                    <div className="loading-state">Loading evidence records...</div>
-                  ) : evidenceFiles.length === 0 ? (
-                    <div className="empty-card evidence-empty">
-                      <div className="evidence-empty-icon">&#128196;</div>
-                      <h3>No Evidence Ingested for this Case</h3>
-                      <p>Upload text files (.txt, max 5 MB per file). Original file bytes will be cryptographically preserved, hashed with SHA-256, and indexed line-by-line.</p>
-                      <label htmlFor="evidence-file-input" className="btn-primary upload-label">
-                        Ingest First File
-                      </label>
-                    </div>
-                  ) : (
-                    <div className="table-wrapper">
-                      <table className="data-table">
-                        <thead>
-                          <tr>
-                            <th>Evidence File</th>
-                            <th>Size</th>
-                            <th>SHA-256 Hash</th>
-                            <th>Lines</th>
-                            <th>Uploaded (local time)</th>
-                            <th>Action</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {evidenceFiles.map((ev) => (
-                            <tr key={ev.id}>
-                              <td className="case-title-cell font-bold">{ev.original_filename}</td>
-                              <td>{(ev.file_size / 1024).toFixed(1)} KB</td>
-                              <td className="mono-cell">
-                                <span title={ev.sha256_hash}>
-                                  {ev.sha256_hash.substring(0, 16)}...
-                                </span>
-                              </td>
-                              <td>{ev.line_count.toLocaleString()}</td>
-                              <td>{formatTimestamp(ev.uploaded_at)}</td>
-                              <td>
-                                <button className="btn-table-action" onClick={() => handleOpenInspector(ev)}>
-                                  Inspect Evidence
-                                </button>
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-                </div>
               </div>
             ) : null}
           </div>
@@ -2050,13 +2162,23 @@ function App() {
         {/* EVIDENCE INSPECTOR MODAL */}
         {inspectedFile && (
           <div className="modal-overlay" onClick={closeInspector}>
-            <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-content" role="dialog" aria-modal="true" aria-labelledby="inspector-title"
+              onClick={(e) => e.stopPropagation()}
+              onKeyDown={(event) => {
+                if (event.key === 'Escape') { event.stopPropagation(); closeInspector(); }
+                if (event.key === 'Tab') {
+                  const controls = Array.from(event.currentTarget.querySelectorAll('button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex="0"]'));
+                  const first = controls[0], last = controls[controls.length - 1];
+                  if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+                  else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+                }
+              }}>
               <div className="modal-header">
                 <div>
                   <div className="inspector-meta-tag">Evidence Inspector</div>
-                  <h2 className="modal-title">{inspectedFile.original_filename}</h2>
+                  <h2 className="modal-title" id="inspector-title">{inspectedFile.original_filename}</h2>
                 </div>
-                <button className="btn-close" onClick={closeInspector}>&times;</button>
+                <button type="button" className="btn-close" aria-label="Close Evidence Inspector" onClick={closeInspector}>&times;</button>
               </div>
 
               {/* Inspector Meta Ribbon */}
@@ -2195,6 +2317,57 @@ function App() {
           </div>
         )}
       </main>
+
+      {currentView === 'case-detail' && currentCase?.id === selectedCaseId && !caseLoading && !caseError && (
+        <div className="case-chat-workspace" inert={!!inspectedFile}>
+          <button type="button" className="chat-launcher" ref={chatLauncherRef} hidden={chatOpen}
+            onClick={openChat} aria-controls="case-chat-panel" aria-expanded={chatOpen}>
+            <span className="chat-launcher-mark" aria-hidden="true">✦</span>
+            Ask This Case
+            {!chatOpen && chatLoading && <span className="chat-working-label">Working…</span>}
+          </button>
+          <aside id="case-chat-panel" className="chat-panel" role="dialog" aria-labelledby="chat-panel-title" hidden={!chatOpen}>
+            <header className="chat-panel-header">
+              <div><p className="chat-panel-eyebrow">Evidence-grounded assistant</p><h2 id="chat-panel-title">Ask This Case</h2>
+                <p className="chat-case-label">{currentCase.case_number} · {currentCase.title}</p></div>
+              <button type="button" className="chat-close" aria-label="Close Ask This Case" onClick={closeChat}>×</button>
+            </header>
+            <div className="chat-toolbar">
+              <span>Session only · Google Gemini</span>
+              <button type="button" className="chat-clear" onClick={clearChat} disabled={!chatMessages.length && !chatInput && !chatError}>Clear Conversation</button>
+            </div>
+            <div className="chat-transcript" ref={chatTranscriptRef} role="log" aria-label="Case conversation" aria-live="polite" aria-relevant="additions text" tabIndex={0}
+              onScroll={event => { const box = event.currentTarget; chatStickToBottomRef.current = box.scrollHeight - box.scrollTop - box.clientHeight < 80; }}>
+              {chatMessages.length === 0 && <div className="chat-welcome">
+                <span className="section-eyebrow">Your case, with sources</span>
+                <h3>What would you like to investigate?</h3>
+                <p>Ask about a payment, a date, or an inconsistency. Answers link back to the original evidence.</p>
+                {!evidenceLoading && evidenceFiles.length === 0 && <p className="chat-answer-notice">Upload TXT evidence to this case to get started.</p>}
+              </div>}
+              {chatMessages.map(message => <div className="chat-turn" key={message.id}>
+                <div className="chat-message chat-user"><span className="chat-speaker">You</span><p>{message.question}</p></div>
+                <div className="chat-message chat-assistant"><span className="chat-speaker">ChronicleAI</span>
+                  {message.status === 'pending' && <p className="chat-thinking" role="status">Reading this case’s evidence…</p>}
+                  {message.status === 'error' && <p>No answer returned. You can try again.</p>}
+                  {message.answer && <ChatAnswer answer={message.answer} onOpen={handleOpenInspector} />}
+                </div>
+              </div>)}
+            </div>
+            <form className="chat-composer" onSubmit={handleSendChat}>
+              {chatError && <p className="chat-error" role="alert">{chatError}</p>}
+              <label className="chat-composer-label" htmlFor="case-chat-question">Question about this case</label>
+              <div className="chat-compose-row">
+                <textarea id="case-chat-question" ref={chatComposerRef} maxLength={2000} rows={2}
+                  placeholder="Ask a question about the evidence…" value={chatInput}
+                  onChange={event => setChatInput(event.target.value)} onKeyDown={handleChatComposerKeyDown}
+                  aria-describedby="chat-composer-hint" />
+                <button type="submit" className="btn-primary" disabled={chatLoading || !chatInput.trim()}>{chatLoading ? 'Waiting…' : 'Send'}</button>
+              </div>
+              <p id="chat-composer-hint">Enter to send · Shift+Enter for a new line. Verify answers against their sources.</p>
+            </form>
+          </aside>
+        </div>
+      )}
     </div>
   );
 }

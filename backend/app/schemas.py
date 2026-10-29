@@ -164,7 +164,18 @@ class ChatRequest(BaseModel):
     history: List[ChatHistoryTurn] = Field(default_factory=list, max_length=6)
 
 
+class ChatAnswer(BaseModel):
+    """The only primary chat answer. Citations are resolved against this case.
+
+    An insufficient-evidence explanation may have no citations. Positive factual
+    answers and interpretations must pass independent citation validation.
+    """
+    text: str = Field(..., min_length=1, description="Direct answer to the latest question, never a fallback summary")
+    citations: List[AnalysisCitation] = Field(default_factory=list)
+
+
 class ChatResponse(AnalysisResponse):
+    answer: ChatAnswer
     answer_status: Literal["grounded", "interpretation_only", "insufficient_evidence"]
     message: str
 

@@ -2,9 +2,9 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.schemas import ChatRequest, ChatResponse, AnalysisEvidenceScope, TimelineResponse, ReportRequest
+from app.schemas import ChatRequest, ChatResponse, ChatAnswer, AnalysisEvidenceScope, TimelineResponse, ReportRequest
 from app.models import EvidenceFile
-from app.analysis_service import run_case_analysis, get_gemini_model
+from app.analysis_service import run_case_chat, get_gemini_model
 from app.case_tools import require_case, build_timeline, build_report
 
 router = APIRouter(prefix="/api/cases/{case_id}", tags=["case tools"])
@@ -27,16 +27,10 @@ def chat(case_id: int, request: ChatRequest, db: Session = Depends(get_db)):
     if not files or not any(file.line_count for file in files):
         return ChatResponse(case_id=case_id, model_used=get_gemini_model(),
             evidence_scope=AnalysisEvidenceScope(file_count=len(files), line_count=0, total_characters=0),
+            answer=ChatAnswer(text="Upload evidence for this case first; there are no indexed sources to answer your question.", citations=[]),
             answer_status="insufficient_evidence", message="The indexed evidence does not support an answer. Upload evidence for this case first.")
-    analysis = run_case_analysis(case_id, db, question=request.question.strip(),
+    return run_case_chat(case_id, db, question=request.question.strip(),
         previous_questions=[turn.question.strip() for turn in request.history])
-    if analysis.summary or analysis.documented_observations:
-        status, message = "grounded", "Answer statements cite indexed evidence; verify their meaning against the sources."
-    elif analysis.possible_interpretations:
-        status, message = "interpretation_only", "Only tentative interpretations are available; the evidence does not establish a factual answer."
-    else:
-        status, message = "insufficient_evidence", "The indexed evidence does not support an answer to this question."
-    return ChatResponse(**analysis.model_dump(), answer_status=status, message=message)
 
 
 @router.get("/timeline", response_model=TimelineResponse)

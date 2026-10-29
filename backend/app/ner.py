@@ -187,6 +187,68 @@ def is_header_org_false_positive(ent_text: str, ent_end_char: int, full_doc_text
 
     return False
 
+
+def is_non_organization_false_positive(
+    ent_text: str, start_char: int, end_char: int, full_doc_text: str
+) -> bool:
+    """Reject complete non-name expressions or locally unambiguous ORG spans.
+
+    Context is restricted to the same evidence line. Never edit a span or its
+    offsets; ambiguous acronyms and unfamiliar code-like names remain accepted.
+    """
+    clean = ent_text.strip()
+    if not clean or '\n' in ent_text or '\r' in ent_text:
+        return False
+
+    start = start_char + len(ent_text) - len(ent_text.lstrip())
+    end = end_char - (len(ent_text) - len(ent_text.rstrip()))
+    # Do not interpret a partial token (e.g. INR-Labs or RAM-Technologies).
+    if (start > 0 and re.match(r'[\w-]', full_doc_text[start - 1])) or (
+        end < len(full_doc_text) and re.match(r'[\w-]', full_doc_text[end])
+    ):
+        return False
+
+    line_start = full_doc_text.rfind('\n', 0, start) + 1
+    line_end = full_doc_text.find('\n', end)
+    if line_end == -1:
+        line_end = len(full_doc_text)
+    before, after = full_doc_text[line_start:start], full_doc_text[end:line_end]
+
+    # Explicit organization metadata takes precedence over a name's appearance.
+    if re.search(r'\b(?:organization|company|supplier|vendor)[ \t]*:[ \t]*$', before, re.I):
+        return False
+
+    # Conventional ungrouped, Western and Indian-grouped monetary values.
+    amount = r'[+-]?(?:\d{1,3}(?:,\d{3})+|\d{1,2}(?:,\d{2})+,\d{3}|\d+)(?:\.\d{1,2})?'
+    if re.fullmatch(r'INR[ \t\u00a0]+' + amount + r'(?:[ \t]*/-)?', clean, re.I):
+        return True
+    if clean.upper() == 'INR':
+        return bool(
+            re.search(r'\bcurrency(?:[ \t]+code)?[ \t]*:[ \t]*$', before, re.I)
+            or re.match(r'[ \t\u00a0]+' + amount + r'(?![\w]|,\d|\.\d)', after)
+        )
+
+    if clean.upper() == 'RAM':
+        capacity = r'\d+(?:\.\d+)?[ \t]*(?:[KMGT]i?B)\b'
+        return bool(
+            re.search(r'\b' + capacity + r'[ \t]+$', before, re.I)
+            or re.match(r'[ \t]*(?::[ \t]*)?' + capacity, after, re.I)
+        )
+
+    # Known document prefixes need the whole year/serial structure. Other codes
+    # require an adjacent reference label, not just digits or hyphens.
+    if re.fullmatch(r'(?:PO|NOTES)-\d{4}-\d+', clean, re.I):
+        return True
+    return bool(
+        re.fullmatch(r'[A-Za-z][A-Za-z0-9]*[-_/#]\d{4}[-_/#]\d+', clean)
+        and re.search(
+            r'\b(?:document[ \t]+id|purchase[ \t]+order|invoice[ \t]+number|'
+            r'(?:document|case|payment)[ \t]+reference|reference|ref)'
+            r'[ \t]*(?::|#)?[ \t]*$', before, re.I
+        )
+    )
+
+
 def extract_entities_from_file(
     file_record: EvidenceFile,
     nlp=None
@@ -234,6 +296,8 @@ def extract_entities_from_file(
         # Post-Processing 2: Suppress document heading artifacts falsely tagged as ORG
         if ent.label_ == "ORG":
             if is_header_org_false_positive(raw_text, ent.end_char, full_text):
+                continue
+            if is_non_organization_false_positive(raw_text, ent.start_char, ent.end_char, full_text):
                 continue
 
         # Prevent duplicate spans from repeated extraction

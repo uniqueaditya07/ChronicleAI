@@ -40,8 +40,11 @@ def seed(client, number="TOOLS-A", content=b"Transfer recorded on 12 October 202
 
 
 def reply(file_id, **overrides):
-    payload = {"summary": [{"statement": "A transfer is documented.", "classification": "documented_observation",
-        "citations": [{"evidence_file_id": file_id, "start_line": 1, "end_line": 1}]}],
+    citation = {"evidence_file_id": file_id, "start_line": 1, "end_line": 1}
+    payload = {"answer_status": "grounded",
+        "answer": {"text": "A transfer is documented.", "citations": [citation]},
+        "summary": [{"statement": "A transfer is documented.", "classification": "documented_observation",
+        "citations": [citation]}],
         "documented_observations": [], "possible_interpretations": [], "unresolved_questions": []}
     payload.update(overrides)
     return payload
@@ -105,8 +108,10 @@ def test_chat_foreign_case_citation_is_quarantined(case_client):
 
 def test_chat_acknowledges_unsupported_questions(case_client):
     case_id, _ = seed(case_client)
-    mock_response({"summary": [], "documented_observations": [], "possible_interpretations": [],
-        "unresolved_questions": ["No evidence establishes who approved it."]})
+    mock_response(reply(file_id=1, answer_status="insufficient_evidence",
+        answer={"text": "The evidence does not establish who approved it.", "citations": []},
+        summary=[], documented_observations=[], possible_interpretations=[],
+        unresolved_questions=["No evidence establishes who approved it."]))
     response = case_client.post(f"/api/cases/{case_id}/chat", json={"question": "Who approved it?"})
     assert response.status_code == 200
     assert response.json()["answer_status"] == "insufficient_evidence"
@@ -119,6 +124,8 @@ def test_chat_labels_interpretation_only_answer(case_client):
     interpretation = payload["summary"].pop()
     interpretation["classification"] = "possible_interpretation"
     payload["possible_interpretations"] = [interpretation]
+    payload["answer_status"] = "interpretation_only"
+    payload["answer"] = {"text": interpretation["statement"], "citations": interpretation["citations"]}
     mock_response(payload)
     response = case_client.post(f"/api/cases/{case_id}/chat", json={"question": "What could this mean?"})
     assert response.status_code == 200
@@ -362,3 +369,231 @@ def test_quote_snippets_are_verbatim_source_or_rebuilt(case_client, endpoint, sn
     assert citation["snippet"] == expected
     assert citation["evidence_file_id"] == file["id"]
     assert response.json()["warnings"] == []
+
+
+
+def test_chat_conversational_style_is_isolated_from_full_analysis(case_client):
+    from app.analysis_service import ANALYSIS_SYSTEM_INSTRUCTION, CHAT_SYSTEM_INSTRUCTION
+    case_id, file = seed(case_client)
+    mock = mock_response(reply(file["id"]))
+    response = case_client.post(f"/api/cases/{case_id}/analysis")
+    assert response.status_code == 200
+    analysis_call = mock.models.generate_content.call_args.kwargs
+    assert analysis_call["config"].system_instruction == ANALYSIS_SYSTEM_INSTRUCTION
+    expected_prompt = (
+        "EVIDENCE INVENTORY FOR CASE: TOOLS-A - TOOLS-A\n"
+        "File count: 1, Total lines: 2\n\n"
+        f'=== EVIDENCE FILE ID {file["id"]}: "{file["original_filename"]}" (SHA-256: {file["sha256_hash"]}) ===\n'
+        "[Line 1]: Transfer recorded on 12 October 2026.\n"
+        "[Line 2]: Invoice missing on 2026-10-14.\n\n"
+        "INSTRUCTIONS:\n"
+        "Analyze the above evidence lines strictly following the system instructions.\n"
+        "Produce JSON containing:\n"
+        '1. "summary" (key case takeaways grounded in citations)\n'
+        '2. "documented_observations" (facts directly stated in evidence with citations)\n'
+        '3. "possible_interpretations" (cautious, non-definitive inferences with citations)\n'
+        '4. "unresolved_questions" (gaps or open questions)\n'
+    )
+    assert analysis_call["contents"] == expected_prompt
+    response = case_client.post(f"/api/cases/{case_id}/chat", json={
+        "question": "What was recorded?", "history": [{"case_id": case_id, "question": "Was there a transfer?"}]
+    })
+    assert response.status_code == 200
+    chat_call = mock.models.generate_content.call_args.kwargs
+    assert chat_call["config"].system_instruction == CHAT_SYSTEM_INSTRUCTION
+    assert ANALYSIS_SYSTEM_INSTRUCTION not in chat_call["config"].system_instruction
+    assert not chat_call["contents"].startswith(expected_prompt)
+    for forbidden in ["Analyze the above evidence", "key case takeaways", "Produce JSON containing:"]:
+        assert forbidden not in chat_call["contents"]
+    assert "LATEST USER QUESTION" in chat_call["contents"]
+    assert "Was there a transfer?" in chat_call["contents"]
+    assert chat_call["config"].response_schema is not None
+    for instruction in ["latest question", "1-3 natural sentences", "answer.text", "Recording or entering", "insufficient_evidence"]:
+        assert instruction in CHAT_SYSTEM_INSTRUCTION
+    assert chat_call["config"].response_mime_type == analysis_call["config"].response_mime_type == "application/json"
+    assert chat_call["config"].temperature == analysis_call["config"].temperature
+    assert response.json()["summary"][0]["citations"][0]["evidence_file_id"] == file["id"]
+    assert response.json()["summary"][0]["citations"][0]["start_line"] == 1
+    # A later full analysis still uses the exact original prompt and configuration.
+    assert case_client.post(f"/api/cases/{case_id}/analysis").status_code == 200
+    later = mock.models.generate_content.call_args.kwargs
+    assert later["contents"] == expected_prompt
+    assert later["config"].system_instruction == ANALYSIS_SYSTEM_INSTRUCTION
+
+
+def test_chat_brevity_never_truncates_claims_qualifications_or_validated_citations(case_client):
+    case_id, file = seed(case_client)
+    statement = "The record documents a transfer. " * 20
+    payload = reply(file["id"])
+    payload["summary"][0]["statement"] = statement
+    payload["answer"]["text"] = statement
+    payload["possible_interpretations"] = [{
+        "statement": "The missing invoice may indicate a documentation gap; it does not establish wrongdoing.",
+        "classification": "possible_interpretation",
+        "citations": [{"evidence_file_id": file["id"], "start_line": 2, "end_line": 2}],
+    }]
+    mock_response(payload)
+    response = case_client.post(f"/api/cases/{case_id}/chat", json={"question": "Explain the transfer and the uncertainty."})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["summary"][0]["statement"] == statement.strip()
+    assert data["answer"]["text"] == statement.strip()
+    assert data["possible_interpretations"][0]["statement"] == payload["possible_interpretations"][0]["statement"]
+    assert data["possible_interpretations"][0]["classification"] == "possible_interpretation"
+    assert data["possible_interpretations"][0]["citations"][0]["start_line"] == 2
+
+
+
+@pytest.mark.parametrize("explicit_approval", [False, True])
+def test_chat_specific_payment_question_preserves_direct_cited_answer_and_role_distinction(case_client, explicit_approval):
+    content = (
+        b"The payment of INR 450000 was entered by Clerk Kavita Desai.\n"
+        + (b"Anika Rao explicitly approved this payment.\n" if explicit_approval
+           else b"No signed approval or named authorizer is identified in this record.\n")
+    )
+    case_id, file = seed(case_client, content=content)
+    statement = (
+        "Anika Rao approved the payment, according to the explicit approval entry."
+        if explicit_approval else
+        "The available evidence does not identify who approved the payment. Kavita Desai recorded the transaction, but the records do not establish that she authorized it."
+    )
+    payload = reply(file["id"])
+    payload["summary"][0].update(statement=statement, citations=[{
+        "evidence_file_id": file["id"], "start_line": 1, "end_line": 2,
+    }])
+    payload["answer"] = {"text": statement, "citations": payload["summary"][0]["citations"]}
+    payload["answer_status"] = "grounded" if explicit_approval else "insufficient_evidence"
+    payload["documented_observations"] = [{
+        "statement": "The transaction was entered by Clerk Kavita Desai.",
+        "classification": "documented_observation",
+        "citations": [{"evidence_file_id": file["id"], "start_line": 1, "end_line": 1}],
+    }]
+    mock = mock_response(payload)
+    question = "Who approved the payment of \u20b9450,000?"
+    response = case_client.post(f"/api/cases/{case_id}/chat", json={
+        "question": question, "history": [{"case_id": case_id, "question": "What is the case background?"}],
+    })
+    assert response.status_code == 200
+    data = response.json()
+    assert data["answer"]["text"] == statement
+    assert data["answer_status"] == ("grounded" if explicit_approval else "insufficient_evidence")
+    citation = data["answer"]["citations"][0]
+    assert citation["evidence_file_id"] == file["id"]
+    assert citation["original_filename"] == file["original_filename"]
+    assert (citation["start_line"], citation["end_line"]) == (1, 2)
+    assert data["documented_observations"][0]["statement"] == payload["documented_observations"][0]["statement"]
+    instructions = mock.models.generate_content.call_args.kwargs["config"].system_instruction
+    for requirement in ["latest question", "first sentence", "1-3 natural sentences", "not a case overview",
+                        "recording or entering", "explicitly supported roles", "unrelated case background"]:
+        assert requirement in instructions.lower()
+    assert json.dumps(question) in mock.models.generate_content.call_args.kwargs["contents"]
+
+
+def test_chat_unestablished_fact_can_remain_insufficient_without_invented_claims_or_citations(case_client):
+    case_id, file = seed(case_client, content=b"A payment was entered. No approval is established in this record.\n")
+    payload = {"answer_status": "insufficient_evidence",
+               "answer": {"text": "The evidence does not establish who approved this payment.", "citations": []},
+               "summary": [], "documented_observations": [], "possible_interpretations": [],
+               "unresolved_questions": ["The evidence does not establish who approved this payment."]}
+    mock = mock_response(payload)
+    response = case_client.post(f"/api/cases/{case_id}/chat", json={"question": "Who approved it?"})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["answer_status"] == "insufficient_evidence"
+    assert "does not support an answer" in data["message"]
+    assert data["summary"] == data["documented_observations"] == data["possible_interpretations"] == []
+    assert data["unresolved_questions"] == payload["unresolved_questions"]
+    instructions = mock.models.generate_content.call_args.kwargs["config"].system_instruction
+    assert data["answer"]["text"] == payload["answer"]["text"]
+    assert data["answer"]["citations"] == []
+    assert "immediately explain the missing fact" in instructions
+    assert "do not fabricate a citation" in instructions
+
+
+
+@pytest.mark.parametrize("answer", [None, {}, [], "A recap", {"text": "", "citations": []},
+    {"text": "  ", "citations": []}, {"text": 7, "citations": []},
+    {"text": "Answer", "citations": None}, {"text": "\ud800", "citations": []}])
+def test_chat_rejects_missing_or_malformed_primary_even_with_valid_support(case_client, answer):
+    case_id, file = seed(case_client)
+    payload = reply(file["id"], answer=answer)
+    mock_response(payload)
+    response = case_client.post(f"/api/cases/{case_id}/chat", json={"question": "Who approved the payment?"})
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Failed to parse structured JSON response from Gemini model."
+
+
+def test_chat_legacy_case_summary_without_explicit_answer_is_not_promoted(case_client):
+    case_id, file = seed(case_client)
+    payload = reply(file["id"])
+    del payload["answer"]
+    mock_response(payload)
+    response = case_client.post(f"/api/cases/{case_id}/chat", json={"question": "Who approved it?"})
+    assert response.status_code == 502
+
+
+@pytest.mark.parametrize("status", ["grounded", "interpretation_only"])
+@pytest.mark.parametrize("failure", ["empty", "foreign", "out_of_range"])
+def test_chat_primary_is_validated_independently_and_support_never_establishes_grounding(case_client, status, failure):
+    case_id, file = seed(case_client)
+    _, foreign = seed(case_client, "OTHER-CHAT", b"A foreign case only.\n")
+    invalid = [] if failure == "empty" else [{"evidence_file_id": foreign["id"] if failure == "foreign" else file["id"],
+        "start_line": 1 if failure == "foreign" else 999, "end_line": 1 if failure == "foreign" else 999}]
+    payload = reply(file["id"], answer_status=status, answer={"text": "An unverified named person approved it.", "citations": invalid})
+    mock_response(payload)
+    response = case_client.post(f"/api/cases/{case_id}/chat", json={"question": "Who approved it?"})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["summary"]  # Independently valid supporting facts remain accessible.
+    assert data["answer_status"] == "insufficient_evidence"
+    assert "couldn't validate" in data["answer"]["text"]
+    assert "approved it" not in data["answer"]["text"]
+    assert data["answer"]["citations"] == []
+    assert any("not substituted" in warning for warning in data["warnings"])
+
+
+def test_chat_explicit_answer_not_irrelevant_summary_is_returned_as_primary(case_client):
+    case_id, file = seed(case_client, content=b"A payment of INR 450000 occurred.\nThe extract does not identify the payment approver.\n")
+    payload = reply(file["id"], answer_status="insufficient_evidence", answer={
+        "text": "The extract does not identify who approved the payment.",
+        "citations": [{"evidence_file_id": file["id"], "start_line": 2, "end_line": 2}],
+    })
+    payload["summary"][0]["statement"] = "The case involves a procurement payment of INR 450000."
+    mock_response(payload)
+    response = case_client.post(f"/api/cases/{case_id}/chat", json={"question": "Who approved the payment?"})
+    data = response.json()
+    assert response.status_code == 200
+    assert data["answer"]["text"] == payload["answer"]["text"]
+    assert data["answer"]["citations"][0]["start_line"] == 2
+    assert data["answer_status"] == "insufficient_evidence"
+    assert data["summary"][0]["statement"] == payload["summary"][0]["statement"]
+
+
+def test_chat_uncited_insufficiency_is_independent_of_unrelated_cited_support(case_client):
+    case_id, file = seed(case_client)
+    payload = reply(file["id"], answer_status="insufficient_evidence", answer={
+        "text": "The evidence does not identify an approving officer.", "citations": [],
+    })
+    mock_response(payload)
+    response = case_client.post(f"/api/cases/{case_id}/chat", json={"question": "Who approved it?"})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["answer_status"] == "insufficient_evidence"
+    assert data["answer"] == payload["answer"]
+    assert data["summary"] and data["warnings"] == []
+
+
+@pytest.mark.parametrize("coordinate", [True, 1.5, "1", None])
+def test_chat_primary_coordinates_are_not_coerced(case_client, coordinate):
+    case_id, file = seed(case_client)
+    payload = reply(file["id"])
+    payload["answer"]["citations"][0]["start_line"] = coordinate
+    mock_response(payload)
+    assert case_client.post(f"/api/cases/{case_id}/chat", json={"question": "What happened?"}).status_code == 502
+
+
+def test_chat_contract_is_additive_and_analysis_schema_stays_separate():
+    from app.schemas import AnalysisResponse, ChatResponse
+    assert "answer" not in AnalysisResponse.model_fields
+    assert "answer" in ChatResponse.model_fields
+    assert "answer" in ChatResponse.model_json_schema()["required"]

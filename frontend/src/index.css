@@ -1,12 +1,17 @@
 :root {
-  --primary-color: #2c3e50;
-  --secondary-color: #34495e;
-  --accent-color: #3498db;
-  --background-color: #f8f9fa;
-  --text-color: #212529;
-  --border-color: #dee2e6;
-  --success-color: #28a745;
-  --error-color: #dc3545;
+  color-scheme: light;
+  --primary-color: #142538;
+  --secondary-color: #465668;
+  --accent-color: #735b2c;
+  --background-color: #f2f1ec;
+  --surface-color: #fffefa;
+  --surface-muted: #eeeee8;
+  --text-color: #233346;
+  --muted-color: #536477;
+  --border-color: #d6d9d7;
+  --gold-color: #c7ae77;
+  --success-color: #23704f;
+  --error-color: #ae3434;
   --font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
 }
 
@@ -29,3 +34,8 @@ body {
   display: flex;
   flex-direction: column;
 }
+
+button, input, select, textarea { font: inherit; }
+button, a, input, select, textarea, summary { -webkit-tap-highlight-color: transparent; }
+:focus-visible { outline: 3px solid #8a6829; outline-offset: 3px; }
+::selection { background: #e8dbbd; color: #142538; }
