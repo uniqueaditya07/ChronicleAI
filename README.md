@@ -731,6 +731,19 @@ Before deploying the Vercel frontend, replace the explicit `REPLACE_WITH_RENDER_
 
 Do not configure `CHRONICLE_STORAGE_DIR` for cloud evidence. The Supabase adapter uses private authenticated storage from FastAPI, and Render's local filesystem is ephemeral. The app's existing startup `create_all` is additive for missing tables; it is not a schema migration mechanism. Phase C already created the three tables. Check Render startup logs for successful boot and use `/api/health`.
 
+Evidence-upload HTTP 503 troubleshooting: case creation/retrieval checks the database, not Storage. The public message `Evidence storage is unavailable or misconfigured.` covers local configuration errors, network failures, and all unsuccessful Storage upload responses. It does not establish that Supabase itself returned HTTP 503. Storage warnings in Render now include a fixed `operation`, `category`, and actual `upstream_status`; `none` means no HTTP response was received. Credentials, URLs, object paths, evidence content, raw upstream messages, and exception tracebacks are excluded from these warnings.
+
+| Log category | Check |
+|---|---|
+| `missing_supabase_url`, `missing_service_role_key`, `missing_storage_bucket`, `invalid_project_url`, `invalid_credential_format`, `invalid_backend` | Correct the corresponding backend Render variable. Use the project HTTPS origin, without an API path. |
+| `authentication`, `authorization` | The backend credential must be a privileged key belonging to the same project as `SUPABASE_URL`. Keep the bucket private; do not add public-write policies. |
+| `bucket_not_found` | `SUPABASE_STORAGE_BUCKET` must exactly match an existing bucket ID in that project (`chronicleai-evidence` in the blueprint). The adapter does not create buckets. |
+| `mime_type_rejected`, `file_size_limit` | The Supabase bucket must permit `text/plain` and the uploaded size. Allow at least 5 MiB to cover the app's full upload limit. |
+| `timeout`, `transport_error`, `upstream_unavailable`, `rate_limited` | Check Storage availability, networking, or limits using the recorded HTTP status when present. |
+| `bad_request`, `unexpected_response`, `not_found` | The response did not identify a more specific cause; inspect Supabase's own logs without copying credentials or evidence into diagnostics. |
+
+The existing `SUPABASE_SERVICE_ROLE_KEY` variable accepts a legacy `service_role` JWT (sent as both `apikey` and Bearer authorization) or a newer backend secret key (sent as `apikey` only). New secret keys are not JWTs and must not be used as Bearer tokens. Surrounding URL/bucket/key whitespace is trimmed. See [Supabase API key headers](https://supabase.com/docs/guides/getting-started/api-keys#known-limitations) and [Storage error codes](https://supabase.com/docs/guides/storage/debugging/error-codes). Local mocked tests cannot confirm deployed credentials or bucket settings; the first safe failure log after an approved deployment is needed to establish the deployed failure category.
+
 ### Vercel frontend and routing
 
 Set the Vercel project root directory to `frontend`, framework to Vite, build command to `npm run build`, and output directory to `dist`. Vercel reads [frontend/vercel.json](frontend/vercel.json) from that root; it rewrites `/api/*` to Render and sends other paths to `index.html`, preserving existing relative frontend requests and refreshes. API responses are marked `no-store`. This avoids browser credentials and preserves uploads without changing the frontend. The repository-root `vercel.json` is not needed and should not remain; the active configuration belongs only under `frontend/`.

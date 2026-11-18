@@ -104,11 +104,13 @@ async def upload_evidence_file(
             detail=str(e)
         )
 
-    # 8. Save original bytes to disk atomically
+    # 8. Save original bytes through the configured storage backend.
     stored_filename = None
     try:
         stored_filename, _ = save_original_file(case_id, clean_filename, file_bytes)
     except StorageError:
+        # The storage adapter logs a safe category and upstream HTTP status.
+        # Keep provider details and credentials out of the public API response.
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Evidence storage is unavailable or misconfigured."

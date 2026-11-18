@@ -1,6 +1,7 @@
 import os
 import uuid
 import hashlib
+import logging
 import re
 from pathlib import Path
 from typing import Tuple, List, Protocol
@@ -14,6 +15,16 @@ DEFAULT_STORAGE_DIR = os.path.join(
 )
 
 SUPABASE_STORAGE_TIMEOUT_SECONDS = 30.0
+logger = logging.getLogger(__name__)
+
+
+def _log_failure(operation: str, category: str, upstream_status=None) -> None:
+    # Only internal labels and the numeric HTTP status: never URLs, keys, paths,
+    # request/response bodies, filenames, or exception text/tracebacks.
+    logger.warning(
+        "Evidence storage failure backend=supabase operation=%s category=%s upstream_status=%s",
+        operation, category, upstream_status if upstream_status is not None else "none",
+    )
 
 
 class StorageError(Exception):
@@ -26,6 +37,11 @@ class StorageConfigurationError(StorageError):
 
 class StorageNotFoundError(StorageError):
     """A stored evidence object does not exist."""
+
+
+def _configuration_error(category: str, message: str) -> StorageConfigurationError:
+    _log_failure("configure", category)
+    return StorageConfigurationError(message)
 
 
 class EvidenceStorage(Protocol):
@@ -79,7 +95,12 @@ class SupabaseEvidenceStorage:
     """Private Supabase Storage access using backend-only credentials."""
 
     def __init__(self, project_url: str, service_role_key: str, bucket: str):
-        parsed_url = urlsplit(project_url.rstrip("/"))
+        try:
+            parsed_url = urlsplit(project_url.strip().rstrip("/"))
+        except ValueError:
+            raise _configuration_error(
+                "invalid_project_url", "Supabase Storage requires a valid HTTPS project URL."
+            ) from None
         if (
             parsed_url.scheme != "https"
             or not parsed_url.hostname
@@ -89,26 +110,46 @@ class SupabaseEvidenceStorage:
             or parsed_url.query
             or parsed_url.fragment
         ):
-            raise StorageConfigurationError("Supabase Storage requires a valid HTTPS project URL.")
+            raise _configuration_error(
+                "invalid_project_url", "Supabase Storage requires a valid HTTPS project URL."
+            )
         if not service_role_key.strip() or not bucket.strip():
-            raise StorageConfigurationError("Supabase Storage credentials and bucket are required.")
+            raise _configuration_error(
+                "missing_credentials_or_bucket", "Supabase Storage credentials and bucket are required."
+            )
+
+        key = service_role_key.strip()
+        if not key.isascii() or any(
+            character.isspace() or ord(character) < 32 or ord(character) == 127
+            for character in key
+        ):
+            raise _configuration_error(
+                "invalid_credential_format", "Supabase Storage credential format is invalid."
+            )
 
         self.base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-        self.bucket = bucket
-        self.headers = {
-            "apikey": service_role_key.strip(),
-            "Authorization": f"Bearer {service_role_key.strip()}",
-        }
+        self.bucket = bucket.strip()
+        self.headers = {"apikey": key}
+        # Legacy service_role keys are JWTs. New secret keys are opaque API
+        # keys; the Supabase gateway authenticates those via apikey alone.
+        if not key.startswith("sb_secret_"):
+            self.headers["Authorization"] = f"Bearer {key}"
 
     @classmethod
     def from_environment(cls):
         project_url = os.getenv("SUPABASE_URL", "")
         service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
         bucket = os.getenv("SUPABASE_STORAGE_BUCKET", "")
-        if not project_url or not service_role_key or not bucket:
-            raise StorageConfigurationError(
-                "Supabase Storage requires SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, and SUPABASE_STORAGE_BUCKET."
-            )
+        for value, category in (
+            (project_url, "missing_supabase_url"),
+            (service_role_key, "missing_service_role_key"),
+            (bucket, "missing_storage_bucket"),
+        ):
+            if not value.strip():
+                raise _configuration_error(
+                    category,
+                    "Supabase Storage requires SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, and SUPABASE_STORAGE_BUCKET.",
+                )
         return cls(project_url, service_role_key, bucket)
 
     def _object_key(self, case_id: int, stored_filename: str = "") -> str:
@@ -128,6 +169,51 @@ class SupabaseEvidenceStorage:
             f"{self.base_url}/storage/v1/object/"
             f"{access_path}{quote(self.bucket, safe='')}/{quote(key, safe='/')}"
         )
+
+    @staticmethod
+    def _failure_category(response) -> str:
+        # Both modern codes and legacy error shapes occur in Storage. Map to
+        # fixed labels instead of logging upstream text, which can echo secrets.
+        try:
+            payload = response.json()
+        except (ValueError, AttributeError):
+            payload = {}
+        if isinstance(payload, dict):
+            categories = {
+                "NoSuchBucket": "bucket_not_found",
+                "NoSuchKey": "object_not_found",
+                "InvalidJWT": "authentication",
+                "AccessDenied": "authorization",
+                "InvalidMimeType": "mime_type_rejected",
+                "invalid_mime_type": "mime_type_rejected",
+                "EntityTooLarge": "file_size_limit",
+                "InvalidBucketName": "invalid_bucket",
+                "InvalidKey": "invalid_object_key",
+                "ResourceAlreadyExists": "object_conflict",
+                "KeyAlreadyExists": "object_conflict",
+                "DatabaseTimeout": "upstream_timeout",
+                "TenantNotFound": "storage_not_provisioned",
+            }
+            for field in ("code", "error"):
+                code = payload.get(field)
+                if isinstance(code, str) and code in categories:
+                    return categories[code]
+            # Legacy missing-bucket responses often use HTTP 400/not_found.
+            if payload.get("message") == "Bucket not found":
+                return "bucket_not_found"
+            if payload.get("message") == "new row violates row-level security policy":
+                return "authorization"
+        status_categories = {
+            400: "bad_request", 401: "authentication", 403: "authorization",
+            404: "not_found", 409: "object_conflict", 413: "file_size_limit",
+            415: "mime_type_rejected", 429: "rate_limited",
+        }
+        default = "upstream_unavailable" if response.status_code >= 500 else "unexpected_response"
+        return status_categories.get(response.status_code, default)
+
+    @classmethod
+    def _log_response_failure(cls, operation: str, response) -> None:
+        _log_failure(operation, cls._failure_category(response), response.status_code)
 
     @staticmethod
     def _is_missing_response(response) -> bool:
@@ -158,6 +244,9 @@ class SupabaseEvidenceStorage:
                 timeout=SUPABASE_STORAGE_TIMEOUT_SECONDS,
             )
         except httpx.HTTPError as exc:
+            operation = "read" if method == "GET" else "upload"
+            category = "timeout" if isinstance(exc, httpx.TimeoutException) else "transport_error"
+            _log_failure(operation, category)
             raise StorageError("Supabase Storage request failed.") from exc
         return response
 
@@ -165,6 +254,7 @@ class SupabaseEvidenceStorage:
         key = self._object_key(case_id)
         response = self._request("POST", key, content=data)
         if not 200 <= response.status_code < 300:
+            self._log_response_failure("upload", response)
             raise StorageError(f"Supabase Storage upload failed (HTTP {response.status_code}).")
         # The key is opaque metadata; no public or signed object URL is returned.
         return key, key
@@ -172,6 +262,8 @@ class SupabaseEvidenceStorage:
     def read(self, case_id: int, stored_filename: str) -> bytes:
         key = self._object_key(case_id, stored_filename)
         response = self._request("GET", key)
+        if not 200 <= response.status_code < 300:
+            self._log_response_failure("read", response)
         if self._is_missing_response(response):
             raise StorageNotFoundError("Evidence object was not found.")
         if not 200 <= response.status_code < 300:
@@ -190,7 +282,11 @@ class SupabaseEvidenceStorage:
                 timeout=SUPABASE_STORAGE_TIMEOUT_SECONDS,
             )
         except httpx.HTTPError as exc:
+            category = "timeout" if isinstance(exc, httpx.TimeoutException) else "transport_error"
+            _log_failure("cleanup", category)
             raise StorageError("Supabase Storage cleanup failed.") from exc
+        if not 200 <= response.status_code < 300:
+            self._log_response_failure("cleanup", response)
         if not 200 <= response.status_code < 300 and not self._is_missing_response(response):
             raise StorageError(f"Supabase Storage cleanup failed (HTTP {response.status_code}).")
 
@@ -201,6 +297,7 @@ def get_storage_backend() -> EvidenceStorage:
         return LocalEvidenceStorage()
     if backend_name == "supabase":
         return SupabaseEvidenceStorage.from_environment()
+    logger.warning("Evidence storage failure operation=configure category=invalid_backend upstream_status=none")
     raise StorageConfigurationError("CHRONICLE_STORAGE_BACKEND must be 'local' or 'supabase'.")
 
 def get_storage_root() -> str:

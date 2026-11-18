@@ -1,8 +1,11 @@
 """Isolated adapter tests; Supabase requests are always mocked."""
 
 import hashlib
+import json
+import logging
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from app import storage
@@ -36,7 +39,9 @@ def supabase_env(monkeypatch):
     monkeypatch.setenv("SUPABASE_STORAGE_BUCKET", "private-evidence")
 
 
-def test_supabase_upload_uses_private_case_scoped_key_and_no_upsert(monkeypatch, supabase_env):
+@pytest.mark.parametrize("service_key", ["test-service-role-secret", "sb_secret_disposable_test_key"])
+def test_supabase_upload_uses_private_case_scoped_key_and_no_upsert(monkeypatch, supabase_env, service_key):
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", service_key)
     requests = []
 
     def fake_request(method, url, **kwargs):
@@ -52,7 +57,12 @@ def test_supabase_upload_uses_private_case_scoped_key_and_no_upsert(monkeypatch,
     assert requests[0][1] == f"https://demo-project.supabase.co/storage/v1/object/private-evidence/{key}"
     assert requests[0][2]["headers"]["x-upsert"] == "false"
     assert requests[0][2]["headers"]["Content-Type"] == "text/plain"
-    assert requests[0][2]["headers"]["Authorization"] == "Bearer test-service-role-secret"
+    headers = requests[0][2]["headers"]
+    assert headers["apikey"] == service_key
+    if service_key.startswith("sb_secret_"):
+        assert "Authorization" not in headers
+    else:
+        assert headers["Authorization"] == f"Bearer {service_key}"
     assert requests[0][2]["content"] == b"original bytes"
     assert "private note.txt" not in key
     assert "test-service-role-secret" not in key
@@ -153,8 +163,9 @@ def test_report_integrity_uses_configured_storage_and_detects_mismatch(monkeypat
     assert evidence_integrity(file_record) == ("mismatch", hashlib.sha256(content).hexdigest())
 
 
+@pytest.mark.parametrize("failure", ["upstream", "configuration", "timeout"])
 def test_evidence_api_upload_and_verification_use_private_storage_without_contract_changes(
-    monkeypatch, supabase_env
+    monkeypatch, supabase_env, caplog, failure
 ):
     from urllib.parse import unquote, urlsplit
 
@@ -173,6 +184,8 @@ def test_evidence_api_upload_and_verification_use_private_storage_without_contra
 
     def fake_request(method, url, **kwargs):
         if fail_storage["enabled"]:
+            if failure == "timeout":
+                raise httpx.ReadTimeout("test-service-role-secret private evidence")
             return FakeResponse(
                 status_code=503,
                 payload={"message": "test-service-role-secret private evidence"},
@@ -245,14 +258,25 @@ def test_evidence_api_upload_and_verification_use_private_storage_without_contra
         assert corrupted.json()["verification_status"] == "corrupted"
 
         fail_storage["enabled"] = True
+        if failure == "configuration":
+            monkeypatch.delenv("SUPABASE_STORAGE_BUCKET")
         failed_upload = client.post(
             f"/api/cases/{case_id}/evidence",
             files={"file": ("unavailable.txt", b"must not be indexed", "text/plain")},
         )
         assert failed_upload.status_code == 503
+        assert failed_upload.json() == {"detail": "Evidence storage is unavailable or misconfigured."}
         assert "test-service-role-secret" not in failed_upload.text
+        expected_category = {
+            "upstream": "upstream_unavailable", "configuration": "missing_storage_bucket",
+            "timeout": "timeout",
+        }[failure]
+        assert f"category={expected_category}" in caplog.text
+        assert "test-service-role-secret" not in caplog.text
+        assert "private evidence" not in caplog.text
         with Session(engine) as db:
             assert db.query(EvidenceFile).filter_by(original_filename="unavailable.txt").count() == 0
+            assert db.query(EvidenceFile).count() == 1
     finally:
         app.dependency_overrides.clear()
         engine.dispose()
@@ -269,3 +293,134 @@ def test_http_transport_error_is_sanitized(monkeypatch, supabase_env):
         save_original_file(41, "note.txt", b"private evidence")
     assert "test-service-role-secret" not in str(error.value)
     assert "private evidence" not in str(error.value)
+
+
+def test_normalized_configuration_and_secret_auth_round_trip_with_httpx(monkeypatch, supabase_env):
+    monkeypatch.setenv("SUPABASE_URL", "  https://demo-project.supabase.co/ \n")
+    monkeypatch.setenv("SUPABASE_STORAGE_BUCKET", " private-evidence \n")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", " sb_secret_disposable_test_key \n")
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        assert request.headers["apikey"] == "sb_secret_disposable_test_key"
+        assert "authorization" not in request.headers
+        return httpx.Response(200, content=b"original bytes")
+
+    with httpx.Client(transport=httpx.MockTransport(handle)) as client:
+        monkeypatch.setattr(storage.httpx, "request", client.request)
+        key, _ = save_original_file(41, "private note.txt", b"original bytes")
+        assert read_stored_file(41, key) == b"original bytes"
+        remove_stored_file(41, key)
+
+    assert [request.method for request in requests] == ["POST", "GET", "DELETE"]
+    assert requests[0].url.path == f"/storage/v1/object/private-evidence/{key}"
+    assert requests[0].content == b"original bytes"
+    assert requests[0].headers["content-type"] == "text/plain"
+    assert requests[0].headers["x-upsert"] == "false"
+    assert requests[1].url.path == f"/storage/v1/object/authenticated/private-evidence/{key}"
+    assert requests[2].url.path == "/storage/v1/object/private-evidence"
+    assert json.loads(requests[2].content) == {"prefixes": [key]}
+
+
+@pytest.mark.parametrize("status,payload,category", [
+    (401, {"code": "InvalidJWT"}, "authentication"),
+    (403, {"code": "AccessDenied"}, "authorization"),
+    (404, {"code": "NoSuchBucket"}, "bucket_not_found"),
+    (400, {"statusCode": "404", "error": "not_found", "message": "Bucket not found"}, "bucket_not_found"),
+    (400, {"message": "new row violates row-level security policy"}, "authorization"),
+    (400, {"code": "InvalidMimeType"}, "mime_type_rejected"),
+    (415, {"error": "invalid_mime_type"}, "mime_type_rejected"),
+    (413, {"code": "EntityTooLarge"}, "file_size_limit"),
+    (400, {"code": "InvalidBucketName"}, "invalid_bucket"),
+    (400, {"code": "InvalidKey"}, "invalid_object_key"),
+    (429, {}, "rate_limited"),
+    (503, {}, "upstream_unavailable"),
+    (502, ["untrusted upstream text"], "upstream_unavailable"),
+    (400, {"code": ["malformed"]}, "bad_request"),
+])
+def test_failure_logs_only_safe_category_and_actual_http_status(
+    monkeypatch, supabase_env, caplog, status, payload, category
+):
+    if isinstance(payload, dict):
+        payload = {"message": "test-service-role-secret private evidence", **payload}
+    response = FakeResponse(status_code=status, payload=payload)
+    monkeypatch.setattr(storage.httpx, "request", lambda *args, **kwargs: response)
+
+    with pytest.raises(StorageError), caplog.at_level(logging.WARNING, logger="app.storage"):
+        save_original_file(41, "sensitive-filename.txt", b"private evidence")
+
+    assert f"operation=upload category={category} upstream_status={status}" in caplog.text
+    for private_value in (
+        "test-service-role-secret", "private evidence", "sensitive-filename.txt",
+        "demo-project", "private-evidence", "case_41/", "malformed",
+    ):
+        assert private_value not in caplog.text
+    assert len(caplog.records) == 1
+    assert caplog.records[0].exc_info is None
+
+
+def test_non_json_upstream_failure_is_logged_safely(monkeypatch, supabase_env, caplog):
+    response = httpx.Response(502, text="test-service-role-secret private evidence")
+    monkeypatch.setattr(storage.httpx, "request", lambda *args, **kwargs: response)
+    with pytest.raises(StorageError):
+        save_original_file(41, "note.txt", b"private evidence")
+    assert "category=upstream_unavailable upstream_status=502" in caplog.text
+    assert "test-service-role-secret" not in caplog.text
+    assert "private evidence" not in caplog.text
+
+
+@pytest.mark.parametrize("exception,category", [
+    (httpx.ConnectError, "transport_error"),
+    (httpx.ConnectTimeout, "timeout"),
+    (httpx.ReadTimeout, "timeout"),
+])
+def test_transport_failure_logs_no_exception_details(monkeypatch, supabase_env, caplog, exception, category):
+    def fail(*args, **kwargs):
+        raise exception("test-service-role-secret private evidence")
+
+    monkeypatch.setattr(storage.httpx, "request", fail)
+    with pytest.raises(StorageError):
+        save_original_file(41, "note.txt", b"private evidence")
+    assert f"operation=upload category={category} upstream_status=none" in caplog.text
+    assert "test-service-role-secret" not in caplog.text
+    assert "private evidence" not in caplog.text
+
+
+@pytest.mark.parametrize("variable,value,category", [
+    ("SUPABASE_URL", "", "missing_supabase_url"),
+    ("SUPABASE_URL", "https://demo-project.supabase.co/storage/v1", "invalid_project_url"),
+    ("SUPABASE_URL", "https://[invalid", "invalid_project_url"),
+    ("SUPABASE_SERVICE_ROLE_KEY", " \n", "missing_service_role_key"),
+    ("SUPABASE_SERVICE_ROLE_KEY", "test-service-role-secret\ninvalid", "invalid_credential_format"),
+    ("SUPABASE_STORAGE_BUCKET", " \n", "missing_storage_bucket"),
+])
+def test_configuration_failure_logs_category_without_a_request(
+    monkeypatch, supabase_env, caplog, variable, value, category
+):
+    monkeypatch.setenv(variable, value)
+
+    def unexpected_request(*args, **kwargs):
+        pytest.fail("Invalid configuration must not send a request")
+
+    monkeypatch.setattr(storage.httpx, "request", unexpected_request)
+    with pytest.raises(StorageConfigurationError):
+        save_original_file(41, "note.txt", b"private evidence")
+    assert f"operation=configure category={category} upstream_status=none" in caplog.text
+    assert "test-service-role-secret" not in caplog.text
+    assert "private evidence" not in caplog.text
+
+
+def test_cleanup_failure_remains_best_effort_but_is_logged(monkeypatch, supabase_env, caplog):
+    response = FakeResponse(status_code=403, payload={"code": "AccessDenied"})
+    monkeypatch.setattr(storage.httpx, "request", lambda *args, **kwargs: response)
+    remove_stored_file(41, "case_41/" + "c" * 32 + ".txt")
+    assert "operation=cleanup category=authorization upstream_status=403" in caplog.text
+
+
+def test_invalid_backend_is_logged_without_echoing_its_value(monkeypatch, caplog):
+    monkeypatch.setenv("CHRONICLE_STORAGE_BACKEND", "invalid-private-value")
+    with pytest.raises(StorageConfigurationError):
+        get_storage_backend()
+    assert "category=invalid_backend upstream_status=none" in caplog.text
+    assert "invalid-private-value" not in caplog.text
