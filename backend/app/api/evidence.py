@@ -17,7 +17,9 @@ from app.storage import (
     validate_and_decode_txt,
     save_original_file,
     remove_stored_file,
-    get_case_storage_dir
+    read_stored_file,
+    StorageError,
+    StorageNotFoundError,
 )
 
 router = APIRouter(prefix="/api/cases/{case_id}/evidence", tags=["evidence"])
@@ -106,6 +108,11 @@ async def upload_evidence_file(
     stored_filename = None
     try:
         stored_filename, _ = save_original_file(case_id, clean_filename, file_bytes)
+    except StorageError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Evidence storage is unavailable or misconfigured."
+        ) from None
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -226,10 +233,9 @@ def verify_evidence_integrity(case_id: int, evidence_id: int, db: Session = Depe
             detail=f"Evidence with ID {evidence_id} not found in case {case_id}."
         )
 
-    case_dir = get_case_storage_dir(case_id)
-    file_path = os.path.join(case_dir, evidence.stored_filename)
-
-    if not os.path.exists(file_path):
+    try:
+        stored_bytes = read_stored_file(case_id, evidence.stored_filename)
+    except StorageNotFoundError:
         return EvidenceVerifyResponse(
             evidence_id=evidence.id,
             original_filename=evidence.original_filename,
@@ -238,11 +244,13 @@ def verify_evidence_integrity(case_id: int, evidence_id: int, db: Session = Depe
             stored_hash=evidence.sha256_hash,
             computed_hash=None,
             verification_status="missing_file",
-            message="Evidence file missing on filesystem: integrity verification failed."
+            message="Evidence file missing from configured storage: integrity verification failed."
         )
-
-    with open(file_path, "rb") as f:
-        stored_bytes = f.read()
+    except StorageError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Evidence storage is temporarily unavailable."
+        ) from None
 
     computed_hash = compute_sha256(stored_bytes)
     matched = (computed_hash.lower() == evidence.sha256_hash.lower())

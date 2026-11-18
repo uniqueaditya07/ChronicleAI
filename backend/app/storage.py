@@ -1,13 +1,207 @@
 import os
 import uuid
 import hashlib
+import re
 from pathlib import Path
-from typing import Tuple, List
+from typing import Tuple, List, Protocol
+from urllib.parse import quote, urlsplit
+
+import httpx
 
 # Default storage directory: backend/storage/evidence
 DEFAULT_STORAGE_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "storage", "evidence"
 )
+
+SUPABASE_STORAGE_TIMEOUT_SECONDS = 30.0
+
+
+class StorageError(Exception):
+    """Base error for configured evidence storage failures."""
+
+
+class StorageConfigurationError(StorageError):
+    """Storage backend configuration is missing or invalid."""
+
+
+class StorageNotFoundError(StorageError):
+    """A stored evidence object does not exist."""
+
+
+class EvidenceStorage(Protocol):
+    def save(self, case_id: int, data: bytes) -> Tuple[str, str]: ...
+    def read(self, case_id: int, stored_filename: str) -> bytes: ...
+    def remove(self, case_id: int, stored_filename: str) -> None: ...
+
+
+class LocalEvidenceStorage:
+    """Existing case-scoped filesystem vault."""
+
+    def save(self, case_id: int, data: bytes) -> Tuple[str, str]:
+        case_dir = get_case_storage_dir(case_id)
+        stored_filename = f"{uuid.uuid4().hex}.txt"
+        full_path = os.path.join(case_dir, stored_filename)
+
+        resolved_path = Path(full_path).resolve()
+        resolved_case_dir = Path(case_dir).resolve()
+        if not resolved_path.is_relative_to(resolved_case_dir):
+            raise ValueError("Illegal path traversal detected.")
+
+        with open(full_path, "wb") as evidence_file:
+            evidence_file.write(data)
+        return stored_filename, full_path
+
+    def read(self, case_id: int, stored_filename: str) -> bytes:
+        storage_root = Path(os.getenv("CHRONICLE_STORAGE_DIR", DEFAULT_STORAGE_DIR)).resolve()
+        case_dir = (storage_root / f"case_{case_id}").resolve()
+        file_path = (case_dir / stored_filename).resolve()
+        if not file_path.is_relative_to(case_dir):
+            raise ValueError("Illegal path traversal detected.")
+        try:
+            return file_path.read_bytes()
+        except FileNotFoundError as exc:
+            raise StorageNotFoundError("Evidence object was not found.") from exc
+
+    def remove(self, case_id: int, stored_filename: str) -> None:
+        storage_root = Path(os.getenv("CHRONICLE_STORAGE_DIR", DEFAULT_STORAGE_DIR)).resolve()
+        case_dir = (storage_root / f"case_{case_id}").resolve()
+        file_path = (case_dir / stored_filename).resolve()
+        if not file_path.is_relative_to(case_dir):
+            raise ValueError("Illegal path traversal detected.")
+        try:
+            file_path.unlink(missing_ok=True)
+        except OSError:
+            # Preserve the existing best-effort local rollback behavior.
+            pass
+
+
+class SupabaseEvidenceStorage:
+    """Private Supabase Storage access using backend-only credentials."""
+
+    def __init__(self, project_url: str, service_role_key: str, bucket: str):
+        parsed_url = urlsplit(project_url.rstrip("/"))
+        if (
+            parsed_url.scheme != "https"
+            or not parsed_url.hostname
+            or parsed_url.username
+            or parsed_url.password
+            or parsed_url.path
+            or parsed_url.query
+            or parsed_url.fragment
+        ):
+            raise StorageConfigurationError("Supabase Storage requires a valid HTTPS project URL.")
+        if not service_role_key.strip() or not bucket.strip():
+            raise StorageConfigurationError("Supabase Storage credentials and bucket are required.")
+
+        self.base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+        self.bucket = bucket
+        self.headers = {
+            "apikey": service_role_key.strip(),
+            "Authorization": f"Bearer {service_role_key.strip()}",
+        }
+
+    @classmethod
+    def from_environment(cls):
+        project_url = os.getenv("SUPABASE_URL", "")
+        service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+        bucket = os.getenv("SUPABASE_STORAGE_BUCKET", "")
+        if not project_url or not service_role_key or not bucket:
+            raise StorageConfigurationError(
+                "Supabase Storage requires SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, and SUPABASE_STORAGE_BUCKET."
+            )
+        return cls(project_url, service_role_key, bucket)
+
+    def _object_key(self, case_id: int, stored_filename: str = "") -> str:
+        if stored_filename:
+            expected_prefix = f"case_{case_id}/"
+            if not stored_filename.startswith(expected_prefix):
+                raise ValueError("Evidence object does not belong to the requested case.")
+            name = stored_filename[len(expected_prefix):]
+            if not re.fullmatch(r"[0-9a-f]{32}\.txt", name):
+                raise ValueError("Invalid evidence object key.")
+            return stored_filename
+        return f"case_{case_id}/{uuid.uuid4().hex}.txt"
+
+    def _object_url(self, key: str, *, authenticated_download: bool = False) -> str:
+        access_path = "authenticated/" if authenticated_download else ""
+        return (
+            f"{self.base_url}/storage/v1/object/"
+            f"{access_path}{quote(self.bucket, safe='')}/{quote(key, safe='/')}"
+        )
+
+    @staticmethod
+    def _is_missing_response(response) -> bool:
+        if response.status_code == 404:
+            return True
+        try:
+            payload = response.json()
+        except (ValueError, AttributeError):
+            return False
+        return (
+            isinstance(payload, dict)
+            and str(payload.get("statusCode", "")) == "404"
+            and payload.get("error") == "not_found"
+        )
+
+    def _request(self, method: str, key: str, *, content=None, json_body=None):
+        headers = dict(self.headers)
+        if content is not None:
+            headers["Content-Type"] = "text/plain"
+            headers["x-upsert"] = "false"
+        try:
+            response = httpx.request(
+                method,
+                self._object_url(key, authenticated_download=(method == "GET")),
+                headers=headers,
+                content=content,
+                json=json_body,
+                timeout=SUPABASE_STORAGE_TIMEOUT_SECONDS,
+            )
+        except httpx.HTTPError as exc:
+            raise StorageError("Supabase Storage request failed.") from exc
+        return response
+
+    def save(self, case_id: int, data: bytes) -> Tuple[str, str]:
+        key = self._object_key(case_id)
+        response = self._request("POST", key, content=data)
+        if not 200 <= response.status_code < 300:
+            raise StorageError(f"Supabase Storage upload failed (HTTP {response.status_code}).")
+        # The key is opaque metadata; no public or signed object URL is returned.
+        return key, key
+
+    def read(self, case_id: int, stored_filename: str) -> bytes:
+        key = self._object_key(case_id, stored_filename)
+        response = self._request("GET", key)
+        if self._is_missing_response(response):
+            raise StorageNotFoundError("Evidence object was not found.")
+        if not 200 <= response.status_code < 300:
+            raise StorageError(f"Supabase Storage read failed (HTTP {response.status_code}).")
+        return response.content
+
+    def remove(self, case_id: int, stored_filename: str) -> None:
+        key = self._object_key(case_id, stored_filename)
+        bucket_url = f"{self.base_url}/storage/v1/object/{quote(self.bucket, safe='')}"
+        try:
+            response = httpx.request(
+                "DELETE",
+                bucket_url,
+                headers={**self.headers, "Content-Type": "application/json"},
+                json={"prefixes": [key]},
+                timeout=SUPABASE_STORAGE_TIMEOUT_SECONDS,
+            )
+        except httpx.HTTPError as exc:
+            raise StorageError("Supabase Storage cleanup failed.") from exc
+        if not 200 <= response.status_code < 300 and not self._is_missing_response(response):
+            raise StorageError(f"Supabase Storage cleanup failed (HTTP {response.status_code}).")
+
+
+def get_storage_backend() -> EvidenceStorage:
+    backend_name = os.getenv("CHRONICLE_STORAGE_BACKEND", "local").strip().lower()
+    if backend_name == "local":
+        return LocalEvidenceStorage()
+    if backend_name == "supabase":
+        return SupabaseEvidenceStorage.from_environment()
+    raise StorageConfigurationError("CHRONICLE_STORAGE_BACKEND must be 'local' or 'supabase'.")
 
 def get_storage_root() -> str:
     storage_path = os.getenv("CHRONICLE_STORAGE_DIR", DEFAULT_STORAGE_DIR)
@@ -22,6 +216,10 @@ def get_case_storage_dir(case_id: int) -> str:
 
 def compute_sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def read_stored_file(case_id: int, stored_filename: str) -> bytes:
+    return get_storage_backend().read(case_id, stored_filename)
 
 def validate_and_decode_txt(data: bytes) -> Tuple[str, str, List[str]]:
     """
@@ -53,33 +251,15 @@ def validate_and_decode_txt(data: bytes) -> Tuple[str, str, List[str]]:
 
 def save_original_file(case_id: int, original_filename: str, data: bytes) -> Tuple[str, str]:
     """
-    Saves original bytes under the case-specific storage directory using a safe UUID.
-    Returns (stored_filename, full_file_path).
-    Prevents path traversal and never uses user-supplied filenames on disk.
+    Saves original bytes in the configured backend using a generated opaque key.
+    Returns (stored_filename, local_path_or_key); user filenames never form object keys.
     """
-    case_dir = get_case_storage_dir(case_id)
-    # Generate random unique filename with .bin/.txt suffix
-    safe_uuid = uuid.uuid4().hex
-    stored_filename = f"{safe_uuid}.txt"
-    full_path = os.path.join(case_dir, stored_filename)
-
-    # Ensure path doesn't escape case_dir
-    resolved_path = Path(full_path).resolve()
-    resolved_case_dir = Path(case_dir).resolve()
-    if not str(resolved_path).startswith(str(resolved_case_dir)):
-        raise ValueError("Illegal path traversal detected.")
-
-    with open(full_path, "wb") as f:
-        f.write(data)
-
-    return stored_filename, full_path
+    return get_storage_backend().save(case_id, data)
 
 def remove_stored_file(case_id: int, stored_filename: str) -> None:
     """Safely removes a stored file during rollback/cleanup."""
-    case_dir = get_case_storage_dir(case_id)
-    full_path = os.path.join(case_dir, stored_filename)
-    if os.path.exists(full_path):
-        try:
-            os.remove(full_path)
-        except OSError:
-            pass
+    try:
+        get_storage_backend().remove(case_id, stored_filename)
+    except StorageError:
+        # Preserve the existing best-effort cleanup semantics.
+        pass

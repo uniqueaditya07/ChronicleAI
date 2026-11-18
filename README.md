@@ -87,7 +87,7 @@ Versions below come from [backend requirements](backend/requirements.txt), [fron
 | spaCy | Local English NER; **3.8.16**, model name `en_core_web_sm` | Produces entity spans that can be mapped back to indexed lines; precision rules can reject narrow false positives. | Rules alone miss linguistic variation; model predictions also make mistakes and need review. |
 | Google Gemini and Google GenAI SDK | Optional analysis/chat; SDK **2.32.0** | Generates structured output from the active case's indexed evidence. Chat uses SDK schema-constrained JSON plus server validation. | A different or local model would require an adapter and its own validation/evaluation; provider access and latency remain external dependencies. |
 | SHA-256 via `hashlib` | Original-byte hashing and integrity comparisons | Links inventory metadata to the bytes originally ingested. | Hashes detect changes relative to a recorded digest; they do not establish acquisition provenance or prevent tampering with both file and metadata. |
-| Local filesystem | UUID-named original TXT files in case directories | Keeps original bytes separate from searchable relational metadata. | Object storage could suit distributed deployment but would require new access, consistency, and backup controls. |
+| Evidence storage | Local filesystem by default; optional private Supabase Storage adapter | Keeps original bytes separate from searchable relational metadata. Supabase keys are generated inside a case-scoped namespace and accessed only by FastAPI. | Object storage has separate commit/cleanup behavior from the relational database; interrupted cleanup can leave an orphaned object. |
 | pytest, HTTPX, FastAPI TestClient, and mocks | Backend tests; **8.3.3**, **0.28.1** for pytest/HTTPX | Exercise API behavior, persistence, citation boundaries, and provider failures without live Gemini calls. | Mocked model responses test application guarantees, not a real model's semantic relevance. |
 | Node `node:test` and `assert` | Frontend regression harness | Runs actual production handlers with simulated hooks and controlled request ordering, without a browser-test dependency. | It does not render React or establish visual/accessibility correctness. |
 | Oxlint | Frontend static checks; lockfile **1.81.0** | Checks JavaScript/React rules using the existing lint script. | The manifest allows `^1.79.0`; `npm ci` reproduces the checked-in resolution. |
@@ -275,9 +275,9 @@ Chat history, entity results, timeline results, and AI outputs have no dedicated
 
 ### Evidence upload and indexing
 
-[evidence.py](backend/app/api/evidence.py) verifies the case, checks the `.txt` filename and 5 MiB limit while reading bounded chunks, rejects empty files, computes SHA-256, and checks for duplicate bytes in that case. [storage.py](backend/app/storage.py) validates UTF-8/UTF-8 BOM and rejects null bytes, writes original bytes under a UUID filename inside `case_<id>`, and supplies decoded logical lines for indexing.
+[evidence.py](backend/app/api/evidence.py) verifies the case, checks the `.txt` filename and 5 MiB limit while reading bounded chunks, rejects empty files, computes SHA-256, and checks for duplicate bytes in that case. [storage.py](backend/app/storage.py) validates UTF-8/UTF-8 BOM and rejects null bytes, writes original bytes through the configured local or Supabase adapter, and supplies decoded logical lines for indexing. Local storage remains the default. Supabase objects use `case_<id>/<uuid>.txt` keys in a private bucket; the backend service-role credential is used only by FastAPI.
 
-The backend commits file metadata and indexed lines and attempts filesystem cleanup on failed database insertion. Database transactions and filesystem writes are separate operations, not one cross-storage atomic transaction. Original line endings/BOM remain in the stored bytes; line indexing uses decoded `splitlines()` content. Entity character offsets refer to reconstructed indexed text, not byte offsets in the original file.
+The backend commits file metadata and indexed lines and attempts cleanup in the selected storage backend if database insertion fails. Database transactions and object-storage writes are separate operations, not one cross-storage atomic transaction; failed remote cleanup can leave an orphaned object. Original line endings/BOM remain in the stored bytes; line indexing uses decoded `splitlines()` content. Entity character offsets refer to reconstructed indexed text, not byte offsets in the original file.
 
 ### SHA-256 verification
 
@@ -454,8 +454,14 @@ The application reads environment variables directly. [.env.example](.env.exampl
 | `GOOGLE_API_KEY` | Alternative read when `GEMINI_API_KEY` is unset/empty. Configure one key source to avoid ambiguity. |
 | `GEMINI_MODEL` | `gemini-3.5-flash-lite`. Overrides the model for both full analysis and dedicated chat. The model must be available to your API project and support the requested generation features. |
 | `GEMINI_MAX_CONTEXT_CHARS` | `100000`. Counts indexed line-content characters before AI context is assembled. Use a positive integer; a non-integer value falls back to the default. Over-budget evidence returns 413 instead of being silently truncated. |
-| `DATABASE_URL` | SQLite URL for `backend/chronicle.db`. Absolute `sqlite:///...` paths make dataset selection explicit. Other SQLAlchemy database URLs are not a verified migration/deployment path. |
+| `DATABASE_URL` | Optional SQLAlchemy URL. If unset, uses SQLite at `backend/chronicle.db`. PostgreSQL URLs use the pinned psycopg 3 driver, require TLS by default, and use a small bounded connection pool. |
 | `CHRONICLE_STORAGE_DIR` | `backend/storage/evidence`. Use an absolute path for a custom vault; changing it does not move existing originals or rewrite database metadata. |
+| `CHRONICLE_STORAGE_BACKEND` | `local`. Set to `supabase` only when configuring the three Supabase variables below. |
+| `SUPABASE_URL` | Required for the Supabase backend; project HTTPS URL, such as `https://your-project.supabase.co`. |
+| `SUPABASE_SERVICE_ROLE_KEY` | Required for the Supabase backend. Privileged backend secret; never set this in Vercel or frontend variables. |
+| `SUPABASE_STORAGE_BUCKET` | Required for the Supabase backend; use the existing private bucket name. |
+
+Supabase object operations are made by FastAPI using the backend service-role key. Keep the bucket private; the frontend receives only the existing evidence metadata response and never receives signed or public object URLs. The adapter uses generated case-scoped keys and does not overwrite existing objects. A storage failure returns a controlled error and does not insert evidence metadata. Storage and database commits are separate, so a failed database commit can leave an object if remote cleanup also fails.
 
 The shared Gemini client uses a **60,000 ms HTTP timeout**. Analysis/chat configurations use JSON output and temperature **0.2**; dedicated chat additionally supplies a response schema. The browser aborts AI requests after **75 seconds**. Aborting a browser request does not guarantee that a provider operation has stopped server-side.
 
@@ -553,20 +559,28 @@ with tempfile.TemporaryDirectory(prefix="ChronicleAI-tests-") as directory:
             repo / "backend" / name, root / name,
             ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache", "test_storage*", "test_*storage*"),
         )
+    for name in ("test_postgres_compat.py", "test_storage_adapter.py"):
+        shutil.copy2(repo / "backend" / name, root / name)
     temporary = root / "tmp"
     temporary.mkdir()
     env = os.environ.copy()
-    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "PYTHONPATH", "PYTHONHOME", "PYTEST_ADDOPTS", "PYTEST_PLUGINS"):
+    for name in (
+        "GEMINI_API_KEY", "GOOGLE_API_KEY", "SUPABASE_URL",
+        "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_STORAGE_BUCKET",
+        "DATABASE_URL", "CHRONICLE_STORAGE_BACKEND", "PYTHONPATH",
+        "PYTHONHOME", "PYTEST_ADDOPTS", "PYTEST_PLUGINS",
+    ):
         env.pop(name, None)
     env.update(
         DATABASE_URL="sqlite:///" + (root / "application.db").as_posix(),
         CHRONICLE_STORAGE_DIR=str(root / "evidence"),
+        CHRONICLE_STORAGE_BACKEND="local",
         TEMP=str(temporary), TMP=str(temporary), TMPDIR=str(temporary),
         PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", PYTHONDONTWRITEBYTECODE="1",
         GEMINI_MODEL="gemini-3.5-flash-lite", GEMINI_MAX_CONTEXT_CHARS="100000",
     )
     subprocess.run(
-        [sys.executable, "-B", "-m", "pytest", "tests", "-q", "-p", "no:cacheprovider",
+        [sys.executable, "-B", "-m", "pytest", "tests", "test_postgres_compat.py", "test_storage_adapter.py", "-q", "-p", "no:cacheprovider",
          "--basetemp", str(root / "pytest-data")],
         cwd=root, env=env, check=True,
     )
@@ -574,7 +588,7 @@ with tempfile.TemporaryDirectory(prefix="ChronicleAI-tests-") as directory:
 if ($LASTEXITCODE -ne 0) { throw 'Backend regression suite failed.' }
 ```
 
-The actual pytest command inside the copy is `python -B -m pytest tests -q -p no:cacheprovider --basetemp <disposable-path>`. The enclosing script makes its working directory and storage safe. Existing Gemini tests inject mocks and do not need a live key; spaCy model-backed tests still need the installed English model.
+The actual pytest command inside the copy is `python -B -m pytest tests test_postgres_compat.py test_storage_adapter.py -q -p no:cacheprovider --basetemp <disposable-path>`. The PostgreSQL-specific tests compile schema and search SQL and validate URL settings without a server; they do not establish runtime PostgreSQL compatibility. Storage adapter tests mock all Supabase requests. The enclosing script removes cloud/database connection settings and credentials from the child environment, selects local storage, and uses only its temporary SQLite file and evidence directory. Existing Gemini tests inject mocks and do not need a live key; spaCy model-backed tests need the installed English model.
 
 Coverage includes case persistence/isolation, ingestion and byte preservation, duplicate detection, literal search, NER/provenance, date uncertainty, analysis and chat contracts, malformed provider output, source ownership and coordinates, unsupported answers, model errors, report escaping, and integrity handling. Dedicated-chat tests include missing/malformed primary answers, unrelated cited recaps, recorder-versus-approver distinctions, and refusal to promote supporting claims.
 
@@ -651,7 +665,9 @@ ChronicleAI/
 │   │       ├── entities.py           # Grouped entity results and summary counts
 │   │       ├── analysis.py           # Full Case Analysis endpoint
 │   │       └── case_tools.py         # Dedicated chat, timeline and report endpoints
-│   └── tests/                        # pytest API, persistence, NER, analysis/chat and integrity tests
+│   ├── tests/                        # pytest API, persistence, NER, analysis/chat and integrity tests
+│   ├── test_postgres_compat.py       # Offline PostgreSQL URL and SQL compilation checks
+│   └── test_storage_adapter.py       # Filesystem and mocked Supabase storage checks
 └── frontend/
     ├── package.json                  # React/Vite dependencies and development/check scripts
     ├── package-lock.json             # Resolved npm dependency graph
@@ -691,6 +707,62 @@ Planned views include the dashboard, case workspace, Evidence Inspector, and flo
 - **Provider dependency:** Gemini features need internet, credentials, a usable model, and quota. Long evidence, provider capacity, and model access can fail or time out. Browser aborts are best-effort cancellation.
 - **Temporary AI state:** chat and analysis do not survive case navigation/reload as saved database records. Chat context contains prior user questions only, and there is no token-streaming endpoint.
 - **Export/deployment:** reports are HTML with browser printing. Static frontend compilation does not establish public hosting, HTTPS, authentication, or a reverse-proxy deployment.
+
+## Temporary college demonstration deployment (manual; not yet deployed)
+
+This configuration prepares a **temporary, unauthenticated public demo**. Every case and evidence API route, including Gemini analysis and chat, is publicly reachable. Anyone who finds the URL can read, create, edit, or upload demo records and can consume the configured Gemini quota. Use synthetic evidence only, set a conservative Gemini quota/usage alert in the provider console, share the URL only for the presentation, and shut down the Render service and Vercel project afterward. This setup is not suitable for private, personal, regulated, or real investigative information and does not make the application secure.
+
+### Render backend
+
+The root [render.yaml](render.yaml) defines one free Python web service rooted at `backend/`. It pins Python 3.12.10, installs the pinned requirements, installs the spaCy model compatible with the pinned spaCy version, starts `app.main:app` on Render's `$PORT` bound to `0.0.0.0`, and checks `/api/health`. Render free instances can sleep, restart, and have no persistent disk; PostgreSQL and the private Supabase bucket are therefore required for cloud persistence. [Render port binding](https://render.com/docs/web-services), [Render free service limits](https://render.com/docs/free)
+
+Before deploying the Vercel frontend, replace the explicit `REPLACE_WITH_RENDER_HOST` placeholder in `frontend/vercel.json` with the actual Render service hostname. The placeholder deliberately cannot work as a production destination. The blueprint's `sync: false` entries are secret prompts; enter values directly in the Render dashboard and never commit them. Configure these backend variables:
+
+| Variable | Render value |
+|---|---|
+| `DATABASE_URL` | Supabase PostgreSQL connection URL with TLS. The app enforces `sslmode=require` if omitted and bounds the SQLAlchemy pool to five connections per process. |
+| `CHRONICLE_STORAGE_BACKEND` | `supabase` |
+| `SUPABASE_URL` | Supabase project HTTPS URL |
+| `SUPABASE_SERVICE_ROLE_KEY` | Privileged backend-only Storage credential; never add it to Vercel or a `VITE_` variable |
+| `SUPABASE_STORAGE_BUCKET` | `chronicleai-evidence`; keep this bucket private |
+| `GEMINI_API_KEY` | Gemini key stored only in Render secrets; alternatively the backend supports `GOOGLE_API_KEY` |
+| `GEMINI_MODEL` | Optional override; blueprint uses the existing default `gemini-3.5-flash-lite` |
+| `GEMINI_MAX_CONTEXT_CHARS` | Optional context limit; blueprint uses existing default `100000` |
+
+Do not configure `CHRONICLE_STORAGE_DIR` for cloud evidence. The Supabase adapter uses private authenticated storage from FastAPI, and Render's local filesystem is ephemeral. The app's existing startup `create_all` is additive for missing tables; it is not a schema migration mechanism. Phase C already created the three tables. Check Render startup logs for successful boot and use `/api/health`.
+
+### Vercel frontend and routing
+
+Set the Vercel project root directory to `frontend`, framework to Vite, build command to `npm run build`, and output directory to `dist`. Vercel reads [frontend/vercel.json](frontend/vercel.json) from that root; it rewrites `/api/*` to Render and sends other paths to `index.html`, preserving existing relative frontend requests and refreshes. API responses are marked `no-store`. This avoids browser credentials and preserves uploads without changing the frontend. The repository-root `vercel.json` is not needed and should not remain; the active configuration belongs only under `frontend/`.
+
+Vercel documents a 120-second external rewrite timeout. The Gemini SDK timeout is 60 seconds and browser analysis/chat abort at 75 seconds, giving normal calls headroom; cold starts plus provider latency can still fail. The 5 MiB upload limit should be verified through the deployed route. [Vercel external rewrites](https://vercel.com/docs/routing/rewrites), [Vercel proxy timeout](https://vercel.com/docs/limits)
+
+Browser calls are same-origin through Vercel, so no production CORS origin is needed. Existing local Vite proxy and local CORS origins remain for development. Do not set database, Supabase, or Gemini credentials in Vercel variables.
+
+### Manual release and smoke-test sequence
+
+1. Review the current worktree on `feature/supabase-deployment`. Create a separate deployment branch from this branch or a separate deployment repository only after review. Do not push until separately authorized.
+2. Confirm the Supabase project is `chronicleai-demo`, the three ChronicleAI tables exist, and bucket `chronicleai-evidence` is private. Do not enable public bucket access or migrate local data.
+3. In Render, create a Blueprint or Python web service from the reviewed branch. Set the listed secrets in the Render dashboard, deploy manually after approval, then check `/api/health` and startup logs.
+4. In Vercel, import the reviewed branch; set project root to `frontend`, `npm run build`, and output to `dist`; ensure `frontend/vercel.json` targets the actual Render hostname. Deploy manually only after approval.
+5. Open the Vercel URL and confirm UI load and `/api/health` returns 200 through the rewrite. Inspect browser requests and confirm no secrets appear in frontend assets.
+6. Create a synthetic case and upload a synthetic UTF-8 TXT file. Verify line count, object-backed integrity, Inspector contents, literal search, citations, entities, and timeline.
+7. Run a short Gemini analysis and chat question, check citation navigation, export a report, and inspect its integrity section. These are live cloud/Gemini actions for the user to run during the separately approved rehearsal, not automated tests.
+8. Restart Render and verify the synthetic case, indexed lines, and evidence integrity persist. Do not use SQL truncation or unsupported destructive cleanup.
+9. Roll back by disabling Vercel routing/project or suspending Render. Use the verified local SQLite/filesystem demo as fallback. After the event, shut down public services and rotate/revoke demo credentials.
+
+### Deployment configuration checks
+
+```powershell
+python -m json.tool .\frontend\vercel.json
+git diff --check
+Set-Location .\frontend
+npm test
+npm run lint
+npm run build
+```
+
+For backend verification, run the disposable regression procedure in [Backend regression suite in disposable storage](#backend-regression-suite-in-disposable-storage). It copies app/tests into a temporary folder and scrubs cloud variables. For the additional local API smoke workflow, run from `backend` with the project interpreter: `& .\.venv\Scripts\python.exe .\local_e2e_smoke.py`. It creates a disposable SQLite database and evidence folder, mocks Gemini, and removes its temporary resources automatically. Do not point tests at Supabase or real evidence. Static/configuration checks do not verify cloud credentials, networking, live Gemini, browser behavior, or public-demo security.
 
 ### Future enhancements, not current features
 

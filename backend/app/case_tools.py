@@ -2,9 +2,6 @@
 import calendar
 from datetime import date, datetime, timezone
 from html import escape
-from pathlib import Path
-import hashlib
-import os
 import re
 
 from fastapi import HTTPException
@@ -12,7 +9,12 @@ from sqlalchemy.orm import Session
 
 from app.models import Case, EvidenceFile, EvidenceLine
 from app.schemas import AnalysisCitation, TimelineEvent, TimelineResponse
-from app.storage import DEFAULT_STORAGE_DIR
+from app.storage import (
+    compute_sha256,
+    read_stored_file,
+    StorageError,
+    StorageNotFoundError,
+)
 from app.analysis_service import validate_analysis_payload, validate_and_filter_citations
 
 
@@ -111,21 +113,15 @@ def build_timeline(case_id: int, db: Session) -> TimelineResponse:
 
 def evidence_integrity(file):
     # Reporting must never create storage directories or mutate the vault.
-    case_dir = (Path(os.getenv("CHRONICLE_STORAGE_DIR", DEFAULT_STORAGE_DIR)) / f"case_{file.case_id}").resolve()
-    path = (case_dir / file.stored_filename).resolve()
-    if not path.is_relative_to(case_dir):
-        return "unreadable", None
-    if not path.is_file():
-        return "missing", None
     try:
-        digest = hashlib.sha256()
-        with path.open("rb") as source:
-            for block in iter(lambda: source.read(65536), b""):
-                digest.update(block)
-        computed = digest.hexdigest()
-        return ("verified" if computed.lower() == file.sha256_hash.lower() else "mismatch"), computed
-    except OSError:
+        stored_bytes = read_stored_file(file.case_id, file.stored_filename)
+    except StorageNotFoundError:
+        return "missing", None
+    except (StorageError, OSError, ValueError):
         return "unreadable", None
+
+    computed = compute_sha256(stored_bytes)
+    return ("verified" if computed.lower() == file.sha256_hash.lower() else "mismatch"), computed
 
 
 def build_report(case_id: int, analysis, db: Session) -> str:
